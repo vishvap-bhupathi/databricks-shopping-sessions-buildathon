@@ -1,0 +1,5 @@
+**
+!Dockerfile
+!requirements-docker.txt
+!starter-duckdb/starter-duckdb/run.sh
+!starter-duckdb/starter-duckdb/pipeline/*.py
