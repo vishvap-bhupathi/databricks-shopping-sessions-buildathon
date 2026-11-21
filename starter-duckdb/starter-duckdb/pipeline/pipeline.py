@@ -91,7 +91,9 @@ def clean_events(con, profile, data, staging, window_start, window_end):
                END AS category
         FROM parsed p
         LEFT JOIN aliases a ON p.user_id = a.user_id
-        LEFT JOIN products ON p.product_id = products.product_id AND p.event_type = 'purchase'
+        -- The unique product key preserves one row per event. Keep the
+        -- purchase check in the category projection so this can hash join.
+        LEFT JOIN products ON p.product_id = products.product_id
         WHERE p.event_ms >= ? AND p.event_ms < ?
           AND p.event_ms >= p.ingest_ms - {LATE_MS}
           AND (p.event_type <> 'purchase' OR p.purchase_cents BETWEEN 1 AND 10000000)
