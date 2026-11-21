@@ -49,6 +49,8 @@ Each DuckDB input load streams nullable text in Arrow batches of up to 32,768 ro
 
 The Docker image compiles the event and click CSV reader with Rust at build time. It passes the reader's validity, offset, and text buffers directly to PyArrow. By default, up to four independent files are read in parallel, with one pending batch per reader. Set `SHOPPING_SESSIONS_CSV_WORKERS` to compare worker counts. The compiled loader's source timer records time waiting for a batch, while the load timer also captures work that overlaps with DuckDB. Set `SHOPPING_SESSIONS_PYTHON_CSV=1` to run the Python reference reader in the same image. Source-only runs without the shared library also use the reference reader.
 
+The campaign query credits sessions with a last-click ASOF join and counts assists from merged eligibility intervals and session ranks. Set `SHOPPING_SESSIONS_REFERENCE_ATTRIBUTION=1` to run the original session–click join instead. Run `python3 scripts/test_attribution.py` to compare the two paths on boundary cases and randomized inputs.
+
 ## Submitting and scoring
 
 Submit your public GitHub repository on the Buildathon track page. Enter a commit SHA to score a specific revision, or leave it empty to score the newest commit on the default branch.

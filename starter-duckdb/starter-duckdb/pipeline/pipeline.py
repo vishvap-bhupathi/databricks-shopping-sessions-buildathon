@@ -8,11 +8,11 @@ import tempfile
 
 import duckdb
 
+from attribution import LOOKBACK_MS, write_campaign_daily
 from input_data import LinkedUsers, csv_rows, load_csv, load_rows
 from stage_profile import StageProfile
 
 
-LOOKBACK_MS = 604_800_000
 SESSION_GAP_MS = 1_800_000
 LATE_MS = 86_400_000
 
@@ -184,49 +184,6 @@ def write_user_daily(con, profile, destination):
         ) TO ? (FORMAT PARQUET)
     """, [str(destination)])
     con.execute("DROP TABLE session_events")
-
-
-def write_campaign_daily(con, profile, destination):
-    # One qualifying row per session and campaign. Its best click is enough
-    # to determine last-touch credit, while every row contributes one assist.
-    profile.execute(con, "attribution_join_and_assist_deduplication", f"""
-        CREATE TEMP TABLE session_campaigns AS
-        SELECT s.person_id, s.session_number, s.day, c.campaign_id,
-               min(struct_pack(negative_ms := -c.click_ms, id_bytes := encode(c.click_id))) AS best_click
-        FROM sessions s
-        JOIN clicks c ON s.person_id = c.person_id
-            AND c.click_ms BETWEEN s.session_start - {LOOKBACK_MS} AND s.session_start
-        GROUP BY s.person_id, s.session_number, s.day, c.campaign_id
-    """)
-    con.execute("DROP TABLE clicks")
-    profile.execute(con, "campaign_daily_aggregation_and_parquet", """
-        COPY (
-            WITH winners AS (
-                SELECT person_id, session_number, arg_min(campaign_id, best_click) AS campaign_id
-                FROM session_campaigns
-                GROUP BY person_id, session_number
-            ), credited AS (
-                SELECT coalesce(w.campaign_id, 'organic') AS campaign_id, s.day,
-                       count(*) AS sessions,
-                       count(*) FILTER (WHERE s.has_purchase) AS purchasing_sessions,
-                       cast(sum(s.revenue_cents) AS BIGINT) AS revenue_cents
-                FROM sessions s
-                LEFT JOIN winners w USING (person_id, session_number)
-                GROUP BY 1, 2
-            ), assists AS (
-                SELECT campaign_id, day, count(*) AS assisted_sessions
-                FROM session_campaigns
-                GROUP BY campaign_id, day
-            )
-            SELECT campaign_id, coalesce(c.channel, 'organic') AS channel, day,
-                   coalesce(cr.sessions, 0) AS sessions,
-                   coalesce(cr.purchasing_sessions, 0) AS purchasing_sessions,
-                   coalesce(cr.revenue_cents, 0) AS revenue_cents,
-                   coalesce(a.assisted_sessions, 0) AS assisted_sessions
-            FROM credited cr FULL JOIN assists a USING (campaign_id, day)
-            LEFT JOIN campaigns c USING (campaign_id)
-        ) TO ? (FORMAT PARQUET)
-    """, [str(destination)])
 
 
 def main():
