@@ -1,6 +1,10 @@
 # Shopping Sessions starter: DuckDB skeleton.
 # The scorers are linux/amd64 (Intel Xeon). They build this file natively, so
 # no FROM line pins a platform: `make build` builds for linux/amd64 anywhere.
+FROM rust:1.85-bookworm@sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098febd68cce8fa7c0bc4 AS parser
+COPY native/strict_csv.rs /strict_csv.rs
+RUN rustc --crate-type cdylib -O -C panic=abort /strict_csv.rs -o /libstrict_csv.so
+
 FROM python:3.12-slim-bookworm
 
 # The scorer runs the container as uid 1000; give that uid a name and a home.
@@ -18,6 +22,8 @@ RUN chmod +x /app/run.sh
 # places. run.sh points every temp and cache directory at /scratch.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
+
+COPY --from=parser /libstrict_csv.so /app/pipeline/libstrict_csv.so
 
 WORKDIR /app
 CMD ["/app/run.sh"]

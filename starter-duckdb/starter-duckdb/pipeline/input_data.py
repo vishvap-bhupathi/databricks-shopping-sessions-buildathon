@@ -4,6 +4,8 @@ from itertools import islice
 
 import pyarrow as pa
 
+from compiled_csv import compiled_batches, library
+
 
 BATCH_ROWS = 32_768
 
@@ -75,10 +77,23 @@ def arrow_batches(rows, schema, profile, table):
 
 
 def load_rows(con, profile, table, columns, rows):
+    schema = pa.schema([(name, pa.string()) for name in columns])
+    load_batches(con, profile, table, schema, arrow_batches(rows, schema, profile, table))
+
+
+def load_csv(con, profile, table, columns, paths):
+    lib = library()
+    if lib is None:
+        load_rows(con, profile, table, columns, csv_rows(paths, len(columns)))
+        return
+    schema = pa.schema([(name, pa.large_string()) for name in columns])
+    load_batches(con, profile, table, schema, compiled_batches(lib, paths, schema, profile, table))
+
+
+def load_batches(con, profile, table, schema, batches):
     # Preserve nullable text, including raw numeric and timestamp lexemes.
     # DuckDB pulls batches into its own spill-managed temporary table.
-    schema = pa.schema([(name, pa.string()) for name in columns])
-    with pa.RecordBatchReader.from_batches(schema, arrow_batches(rows, schema, profile, table)) as reader:
+    with pa.RecordBatchReader.from_batches(schema, batches) as reader:
         con.register("_input_batch_reader", reader)
         try:
             profile.execute(

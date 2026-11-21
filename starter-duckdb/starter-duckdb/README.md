@@ -47,6 +47,8 @@ Set `SHOPPING_SESSIONS_PROFILE=1` to emit one JSON record to stderr with stage w
 
 Each DuckDB input load streams nullable text in Arrow batches of up to 32,768 rows. The load timer includes source parsing or row generation and Arrow conversion, which are recorded as nested timings. Timestamp normalization remains in SQL after deduplication. Click deduplication and validation run in one SQL statement, and each daily aggregation feeds its Parquet writer in the same statement. To inspect SQL operator timings and cardinalities, also set `SHOPPING_SESSIONS_PROFILE_DIR` to a writable directory outside the scorer output folders. Use a separate diagnostic run for operator profiles. DuckDB operator times can include work across threads and should be reported alongside stage wall times.
 
+The Docker image compiles the event and click CSV reader with Rust at build time. It passes the reader's validity, offset, and text buffers directly to PyArrow. By default, up to four independent files are read in parallel, with one pending batch per reader. Set `SHOPPING_SESSIONS_CSV_WORKERS` to compare worker counts. The compiled loader's source timer records time waiting for a batch, while the load timer also captures work that overlaps with DuckDB. Set `SHOPPING_SESSIONS_PYTHON_CSV=1` to run the Python reference reader in the same image. Source-only runs without the shared library also use the reference reader.
+
 ## Submitting and scoring
 
 Submit your public GitHub repository on the Buildathon track page. Enter a commit SHA to score a specific revision, or leave it empty to score the newest commit on the default branch.

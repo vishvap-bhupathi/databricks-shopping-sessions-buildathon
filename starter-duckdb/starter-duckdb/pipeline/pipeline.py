@@ -8,7 +8,7 @@ import tempfile
 
 import duckdb
 
-from input_data import LinkedUsers, csv_rows, load_rows
+from input_data import LinkedUsers, csv_rows, load_csv, load_rows
 from stage_profile import StageProfile
 
 
@@ -60,8 +60,8 @@ def define_timestamp_parser(con):
 
 
 def clean_events(con, profile, data, window_start, window_end):
-    load_rows(con, profile, "raw_events", EVENT_COLUMNS,
-              csv_rows(sorted((data / "events").glob("*.csv")), len(EVENT_COLUMNS)))
+    load_csv(con, profile, "raw_events", EVENT_COLUMNS,
+             sorted((data / "events").glob("*.csv")))
     # Materialize the global winner before looking at any validation fields.
     # Fixed-width UTC ingest strings sort chronologically.
     profile.execute(con, "event_deduplication", """
@@ -102,8 +102,8 @@ def clean_events(con, profile, data, window_start, window_end):
 
 
 def clean_clicks(con, profile, data, window_start, window_end):
-    load_rows(con, profile, "raw_clicks", CLICK_COLUMNS,
-              csv_rows(sorted((data / "clicks").glob("*.csv")), len(CLICK_COLUMNS)))
+    load_csv(con, profile, "raw_clicks", CLICK_COLUMNS,
+             sorted((data / "clicks").glob("*.csv")))
     profile.execute(con, "click_deduplication_validation_and_lookup", """
         CREATE TEMP TABLE clicks AS
         WITH winners AS (
