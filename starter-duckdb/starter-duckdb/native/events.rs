@@ -117,6 +117,16 @@ fn validate<'a>(line: &'a [u8], dimensions: &'a Dimensions, start: i64, end: i64
 
 fn validated_fields<'a>(fields: [&'a [u8];7], dimensions: &'a Dimensions,
     start:i64, end:i64, ingest_ms:i64) -> Option<(&'a [u8], i64, Option<i64>, &'a [u8])> {
+    let (user, at, cents, product) = check_event(fields, start, end, ingest_ms)?;
+    let person = dimensions.aliases.get(user).map_or(user, |v| v);
+    let category = if cents.is_some() {
+        dimensions.products.get(product).map_or(&b"unknown"[..], |v| v)
+    } else { &[] };
+    Some((person, at, cents, category))
+}
+fn check_event<'a>(fields: [&'a [u8]; 7], start: i64, end: i64, ingest_ms: i64)
+    -> Option<(&'a [u8], i64, Option<i64>, &'a [u8])>
+{
     let [_, user, ts, _, kind, product, price] = fields;
     if user.is_empty() || product.is_empty() { return None; }
     let cents = match kind {
@@ -126,12 +136,9 @@ fn validated_fields<'a>(fields: [&'a [u8];7], dimensions: &'a Dimensions,
     };
     let at = timestamp(ts)?;
     if at < start || at >= end || at < ingest_ms.checked_sub(DAY_MS)? { return None; }
-    let person = dimensions.aliases.get(user).map_or(user, |v| v);
-    let category = if cents.is_some() {
-        dimensions.products.get(product).map_or(&b"unknown"[..], |v| v)
-    } else { &[] };
-    Some((person, at, cents, category))
+    Some((user, at, cents, product))
 }
+
 
 fn bucket(key: &[u8]) -> usize {
     let h = key_hash(key);

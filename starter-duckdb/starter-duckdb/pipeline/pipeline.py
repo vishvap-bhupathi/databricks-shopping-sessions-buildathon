@@ -10,9 +10,7 @@ import duckdb
 
 from attribution import LOOKBACK_MS, write_campaign_daily
 from event_sessions import SESSION_GAP_MS, build_session_categories
-from input_data import LinkedUsers, csv_rows, load_csv, load_rows
 from native_engine import run_engine
-from native_events import load_native_events
 from stage_profile import StageProfile
 
 
@@ -25,6 +23,8 @@ CLICK_COLUMNS = ("click_id", "user_id", "campaign_id", "ts")
 
 
 def load_dimensions(con, profile, data):
+    from input_data import LinkedUsers, csv_rows, load_rows
+
     linked = LinkedUsers()
     with profile.measure("link_parsing_and_union_find"):
         for a, b in csv_rows(sorted((data / "links").glob("*.csv")), 2):
@@ -62,6 +62,9 @@ def define_timestamp_parser(con):
 
 
 def clean_events(con, profile, data, window_start, window_end):
+    from input_data import load_csv
+    from native_events import load_native_events
+
     paths = sorted((data / "events").glob("*.csv"))
     if load_native_events(con, profile, paths, window_start, window_end):
         return
@@ -106,6 +109,8 @@ def clean_events(con, profile, data, window_start, window_end):
 
 
 def clean_clicks(con, profile, data, window_start, window_end):
+    from input_data import load_csv
+
     load_csv(con, profile, "raw_clicks", CLICK_COLUMNS,
              sorted((data / "clicks").glob("*.csv")))
     profile.execute(con, "click_deduplication_validation_and_lookup", """

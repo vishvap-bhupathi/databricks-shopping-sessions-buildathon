@@ -28,16 +28,69 @@ class EngineTest(unittest.TestCase):
             (root / "campaigns.csv").write_text("campaign_id,channel\n")
             output = root / "output"
             env = dict(os.environ, DATA_DIR=str(root), SCRATCH_DIR=str(root / "scratch"),
-                       OUTPUT_DIR=str(output), SHOPPING_SESSIONS_REFERENCE_ENGINE="0")
+                       OUTPUT_DIR=str(output), SHOPPING_SESSIONS_REFERENCE_ENGINE="0",
+                       SHOPPING_SESSIONS_EVENT_SCAN="", SHOPPING_SESSIONS_PROFILE="1")
             result = subprocess.run(["/app/run.sh"], env=env, capture_output=True,
                                     check=True, text=True)
             self.assertIn("compact event bounds", result.stderr)
+            self.assertIn("event line exceeds index bounds", result.stderr)
             user = con.read_parquet(str(output / "user_daily" / "part-0.parquet"))
             self.assertEqual(user.project("user_id, events, revenue_cents, top_category").fetchall(),
                              [(person, 1, 250, "books")])
             campaign = con.read_parquet(str(output / "campaign_daily" / "part-0.parquet"))
             self.assertEqual(campaign.project("campaign_id, sessions, assisted_sessions").fetchall(),
                              [("organic", 1, 0)])
+
+    def test_skewed_user_dense_clicks_and_cross_shard_invalid_winner(self):
+        start = 1790985600000
+        with tempfile.TemporaryDirectory() as directory, duckdb.connect() as con:
+            root = Path(directory)
+            for folder in ("events", "clicks", "links"):
+                (root / folder).mkdir()
+            (root / "manifest.json").write_text(
+                '{"window_start":"2026-10-03T00:00:00Z","window_end":"2026-10-07T00:00:00Z"}'
+            )
+            (root / "links/a.csv").write_text("a,b\n猫, θ\n", encoding="utf-8")
+            (root / "products.csv").write_text("id,category\np1,猫\np2,z\n", encoding="utf-8")
+            (root / "campaigns.csv").write_text("id,channel\nc0,web\nc1,email\nc2,web\n")
+            for shard, user in enumerate(("猫", " θ")):
+                events = [
+                    f"e{i},{user},{start + i * 21_000},2026-10-03T00:00:00Z,purchase,p{i % 2 + 1},7"
+                    for i in range(shard, 8_000, 2)
+                ]
+                if shard == 1:
+                    events.append(f"e0,{user},bad,2026-10-02T23:59:59Z,view,p1,0")
+                clicks = [
+                    f"c-{i},{user},c{i % 3},{start + (i // 2) * 20_000}"
+                    for i in range(shard, 8_000, 2)
+                ]
+                (root / "events" / f"{shard}.csv").write_text(
+                    "header\n" + "\n".join(events), encoding="utf-8"
+                )
+                (root / "clicks" / f"{shard}.csv").write_text(
+                    "header\n" + "\n".join(clicks), encoding="utf-8"
+                )
+            settings = [("simd", "0", ""), ("scalar", "0", "scalar"), ("reference", "1", "")]
+            for label, reference, scanner in settings:
+                env = dict(os.environ, DATA_DIR=str(root), SCRATCH_DIR=str(root / "scratch"),
+                           OUTPUT_DIR=str(root / label), SHOPPING_SESSIONS_PROFILE="1",
+                           SHOPPING_SESSIONS_REFERENCE_ENGINE=reference,
+                           SHOPPING_SESSIONS_EVENT_SCAN=scanner)
+                result = subprocess.run(["/app/run.sh"], env=env, capture_output=True,
+                                        check=True, text=True)
+                if reference == "0":
+                    self.assertIn("index_metadata", result.stderr)
+                for table in ("user_daily", "campaign_daily"):
+                    con.read_parquet(str(root / label / table / "*.parquet")).create_view(
+                        table + label
+                    )
+            self.assertEqual(con.sql("SELECT sum(events) FROM user_dailysimd").fetchone(), (7_999,))
+            for table in ("user_daily", "campaign_daily"):
+                for path in ("simd", "scalar"):
+                    for a, b in ((path, "reference"), ("reference", path)):
+                        self.assertEqual(con.sql(
+                            f"SELECT * FROM {table}{a} EXCEPT ALL SELECT * FROM {table}{b}"
+                        ).fetchall(), [])
 
     def test_differential(self):
         start = 1790985600000

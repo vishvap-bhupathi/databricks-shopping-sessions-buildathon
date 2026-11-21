@@ -6,59 +6,83 @@ use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
+#[path = "event_index.rs"]
+mod event_index;
+
 type Id<'a> = &'a [u8];
-// Two borrowed byte ranges plus an integer timestamp and packed metadata.
+// Category ordinals follow byte order. Only the immutable user slice needs
+// a pointer. The other fields are a signed timestamp and checked integers.
 #[derive(Clone, Copy)]
 struct Event<'a> {
     person: *const u8,
-    category: *const u8,
     timestamp: i64,
-    lengths_and_price: u64,
+    packed: u64,
     source: PhantomData<&'a [u8]>,
 }
 
-// Both pointers refer to immutable bytes owned by the live input mappings or
-// dimensions. The lifetime prevents workers from outliving those owners.
+// The pointer refers to immutable bytes in live input mappings or dimensions.
 unsafe impl Send for Event<'_> {}
 
+const FIELD_24_MAX: u32 = (1 << 24) - 1;
+
 impl<'a> Event<'a> {
-    fn new(person: Id<'a>, category: Id<'a>, timestamp: i64, price: i64) -> io::Result<Self> {
-        let (Ok(person_len), Ok(category_len), Ok(price)) = (
-            u16::try_from(person.len()),
-            u16::try_from(category.len()),
-            u32::try_from(price),
-        ) else {
+    fn new(person: Id<'a>, category: u32, timestamp: i64, price: i64) -> io::Result<Self> {
+        let (Ok(person_len), Ok(price)) = (u16::try_from(person.len()), u32::try_from(price))
+        else {
             return Err(io::Error::other("compact event bounds"));
         };
-        let lengths_and_price =
-            u64::from(person_len) | (u64::from(category_len) << 16) | (u64::from(price) << 32);
+        if price > FIELD_24_MAX || category > FIELD_24_MAX {
+            return Err(io::Error::other("compact event bounds"));
+        }
         Ok(Self {
             person: person.as_ptr(),
-            category: category.as_ptr(),
             timestamp,
-            lengths_and_price,
+            packed: u64::from(person_len) | (u64::from(price) << 16) | (u64::from(category) << 40),
             source: PhantomData,
         })
     }
 
     fn person(&self) -> Id<'a> {
-        // The constructor records the original contiguous slice length.
-        unsafe { slice::from_raw_parts(self.person, self.lengths_and_price as u16 as usize) }
+        // The original slice length and backing allocation remain valid.
+        unsafe { slice::from_raw_parts(self.person, self.packed as u16 as usize) }
     }
 
-    fn category(&self) -> Id<'a> {
-        // The constructor records the original contiguous slice length.
-        unsafe {
-            slice::from_raw_parts(
-                self.category,
-                (self.lengths_and_price >> 16) as u16 as usize,
-            )
-        }
+    fn category(&self) -> u32 {
+        (self.packed >> 40) as u32
     }
 
     fn price(&self) -> i64 {
-        (self.lengths_and_price >> 32) as i64
+        i64::from((self.packed >> 16) as u32 & FIELD_24_MAX)
     }
+}
+
+struct EngineDimensions {
+    aliases: Dictionary,
+    products: HashMap<Bytes, u32>,
+    categories: Vec<Bytes>,
+    unknown_category: u32,
+}
+
+fn engine_event<'a>(
+    fields: [Id<'a>; 7],
+    dims: &'a EngineDimensions,
+    start: i64,
+    end: i64,
+    ingest: i64,
+) -> io::Result<Option<Event<'a>>> {
+    let Some((user, time, price, product)) = check_event(fields, start, end, ingest) else {
+        return Ok(None);
+    };
+    let person = dims.aliases.get(user).map_or(user, |v| v);
+    let category = if price.is_some() {
+        dims.products
+            .get(product)
+            .copied()
+            .unwrap_or(dims.unknown_category)
+    } else {
+        0
+    };
+    Event::new(person, category, time, price.unwrap_or(0)).map(Some)
 }
 
 type Click<'a> = (i64, Id<'a>, Id<'a>); // time, click ID, campaign
@@ -162,7 +186,7 @@ fn root(parents: &mut [usize], mut i: usize) -> usize {
     i
 }
 
-fn dimensions(data: &Path) -> io::Result<Dimensions> {
+fn dimensions(data: &Path) -> io::Result<EngineDimensions> {
     let maps = files(&data.join("links"))?;
     let mut ids = HashMap::new();
     let (mut parent, mut sizes, mut minimum) = (Vec::new(), Vec::new(), Vec::new());
@@ -195,11 +219,35 @@ fn dimensions(data: &Path) -> io::Result<Dimensions> {
         .into_iter()
         .map(|(id, i)| (id.into(), minimum[root(&mut parent, i)].into()))
         .collect();
-    let products = records(rows(Mapping::open(&data.join("products.csv"))?.bytes()))
+    let catalog = Mapping::open(&data.join("products.csv"))?;
+    let products: Vec<_> = records(rows(catalog.bytes()))
         .filter(|[id, cat]| !id.is_empty() && !cat.is_empty())
-        .map(|[id, cat]| (id.into(), cat.into()))
         .collect();
-    Ok(Dimensions { aliases, products })
+    let unknown = &b"unknown"[..];
+    let mut categories: Vec<_> = products.iter().map(|[_, category]| *category).collect();
+    categories.push(unknown);
+    categories.sort_unstable();
+    categories.dedup();
+    if categories.len() > FIELD_24_MAX as usize + 1 {
+        return Err(io::Error::other("compact category bounds"));
+    }
+    let unknown_category = categories.binary_search(&unknown).unwrap() as u32;
+    let products = products
+        .into_iter()
+        .map(|[id, category]| {
+            (
+                id.into(),
+                categories.binary_search(&category).unwrap() as u32,
+            )
+        })
+        .collect();
+    let categories = categories.into_iter().map(Into::into).collect();
+    Ok(EngineDimensions {
+        aliases,
+        products,
+        categories,
+        unknown_category,
+    })
 }
 
 fn parallel<F>(jobs: usize, workers: usize, f: F) -> io::Result<()>
@@ -230,14 +278,41 @@ where
 // Each slot has a seen bit and a repeated bit. A clear repeated bit proves
 // an ID occurred at most once across all files. Hash collisions only send
 // extra rows to exact winner selection. Malformed rows may set extra bits.
+struct RepeatBitmap {
+    slots: Vec<AtomicU64>,
+}
+impl RepeatBitmap {
+    fn new(chunks: &[&[u8]]) -> Self {
+        let bytes: usize = chunks.iter().map(|s| s.len()).sum();
+        let words = (bytes / 512).clamp(1, 1 << 22).next_power_of_two();
+        Self {
+            slots: (0..words * 2).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    fn mark(&self, hash: usize) {
+        let k = hash & (self.slots.len() * 32 - 1);
+        let bit = 1u64 << (k % 32);
+        let word = &self.slots[k / 32];
+        let previous = word.fetch_or(bit, Ordering::Relaxed);
+        if previous & bit != 0 && previous & (bit << 32) == 0 {
+            word.fetch_or(bit << 32, Ordering::Relaxed);
+        }
+    }
+
+    fn finish(self) -> Vec<u64> {
+        self.slots
+            .chunks_exact(2)
+            .map(|words| {
+                (words[0].load(Ordering::Relaxed) >> 32)
+                    | (words[1].load(Ordering::Relaxed) & 0xffff_ffff_0000_0000)
+            })
+            .collect()
+    }
+}
+
 fn repeat_filter(chunks: &[&[u8]], workers: usize) -> io::Result<Vec<u64>> {
-    let bytes: usize = chunks.iter().map(|s| s.len()).sum();
-    let words = (bytes / 512).clamp(1, 1 << 22).next_power_of_two();
-    let mask = words * 64 - 1;
-    // A shared packed word stores 32 seen bits and their 32 duplicate bits.
-    // Only contending IDs need the second atomic operation. Waiting for all
-    // workers before decoding the bitmap makes relaxed RMW sufficient.
-    let slots: Vec<_> = (0..words * 2).map(|_| AtomicU64::new(0)).collect();
+    let bitmap = RepeatBitmap::new(chunks);
     parallel(chunks.len(), workers, |_, i| {
         let bytes = chunks[i];
         if std::str::from_utf8(bytes).is_err() {
@@ -249,23 +324,11 @@ fn repeat_filter(chunks: &[&[u8]], workers: usize) -> io::Result<Vec<u64>> {
                 .strip_prefix(b"\"")
                 .and_then(|s| s.strip_suffix(b"\""))
                 .unwrap_or(raw);
-            let k = key_hash(id) as usize & mask;
-            let bit = 1u64 << (k % 32);
-            let word = &slots[k / 32];
-            let previous = word.fetch_or(bit, Ordering::Relaxed);
-            if previous & bit != 0 && previous & (bit << 32) == 0 {
-                word.fetch_or(bit << 32, Ordering::Relaxed);
-            }
+            bitmap.mark(key_hash(id) as usize);
         }
         Ok(())
     })?;
-    Ok(slots
-        .chunks_exact(2)
-        .map(|words| {
-            (words[0].load(Ordering::Relaxed) >> 32)
-                | (words[1].load(Ordering::Relaxed) & 0xffff_ffff_0000_0000)
-        })
-        .collect())
+    Ok(bitmap.finish())
 }
 
 const CLASSIFY_STAGES: [&str; 6] = [
@@ -285,7 +348,7 @@ fn record_time(duration: &mut Duration, start: Option<Instant>) {
 
 fn classify<'a>(
     chunks: &[&'a [u8]],
-    dims: &'a Dimensions,
+    dims: &'a EngineDimensions,
     users: &Routes<Event<'a>>,
     start: i64,
     end: i64,
@@ -333,11 +396,11 @@ fn classify<'a>(
                 uncertain[((hash ^ (hash >> 32)) as usize) & (PARTITIONS - 1)].push(line);
             } else {
                 let clock = sample.then(Instant::now);
-                let event = validated_fields(fields, dims, start, end, ingest);
+                let event = engine_event(fields, dims, start, end, ingest)?;
                 record_time(&mut subtimes[3], clock);
-                if let Some((id, t, price, cat)) = event {
+                if let Some(event) = event {
                     let clock = sample.then(Instant::now);
-                    routes[bucket(id)].push(Event::new(id, cat, t, price.unwrap_or(0))?);
+                    routes[bucket(event.person())].push(event);
                     record_time(&mut subtimes[4], clock);
                 }
             }
@@ -373,7 +436,7 @@ fn classify<'a>(
 
 fn route_events<'a>(
     index: Vec<Partition<'a>>,
-    dims: &'a Dimensions,
+    dims: &'a EngineDimensions,
     users: &Routes<Event<'a>>,
     start: i64,
     end: i64,
@@ -395,8 +458,13 @@ fn route_events<'a>(
         }
         let mut routes = vec![Vec::new(); PARTITIONS];
         for (_, line) in winners.into_values() {
-            if let Some((id, t, price, cat)) = validate(line, dims, start, end) {
-                routes[bucket(id)].push(Event::new(id, cat, t, price.unwrap_or(0))?);
+            let mut fields = [&[][..]; 7];
+            if parse(line, &mut fields) {
+                if let Some(ingest) = datetime(fields[3]) {
+                    if let Some(event) = engine_event(fields, dims, start, end, ingest)? {
+                        routes[bucket(event.person())].push(event);
+                    }
+                }
             }
         }
         publish(users, &mut routes);
@@ -406,7 +474,7 @@ fn route_events<'a>(
 
 fn route_clicks<'a>(
     chunks: &[&'a [u8]],
-    dims: &'a Dimensions,
+    dims: &'a EngineDimensions,
     campaigns: &HashMap<Id, Id>,
     users: &Routes<Routed<'a, Click<'a>>>,
     start: i64,
@@ -440,8 +508,13 @@ fn route_clicks<'a>(
 // the scratch-file boundary. An empty category is the only nullable output.
 fn hex(out: &mut impl Write, value: Id) -> io::Result<()> {
     const DIGITS: &[u8] = b"0123456789abcdef";
-    for &b in value {
-        out.write_all(&[DIGITS[(b >> 4) as usize], DIGITS[(b & 15) as usize]])?;
+    let mut encoded = [0u8; 256];
+    for bytes in value.chunks(encoded.len() / 2) {
+        for (&byte, pair) in bytes.iter().zip(encoded.chunks_exact_mut(2)) {
+            pair[0] = DIGITS[(byte >> 4) as usize];
+            pair[1] = DIGITS[(byte & 15) as usize];
+        }
+        out.write_all(&encoded[..bytes.len() * 2])?;
     }
     Ok(())
 }
@@ -458,7 +531,7 @@ type Totals<'a> = HashMap<(Id<'a>, i64), Campaign>;
 #[derive(Default)]
 struct Workspace<'a> {
     starts: Vec<i64>,
-    categories: HashMap<Id<'a>, i64>,
+    categories: HashMap<u32, i64>,
     ends: HashMap<Id<'a>, i64>,
 }
 
@@ -493,6 +566,7 @@ fn aggregate<'a>(
     id: Id,
     events: &[Event<'a>],
     clicks: &[Routed<'a, Click<'a>>],
+    category_names: &[Bytes],
     workspace: &mut Workspace<'a>,
     totals: &mut Totals<'a>,
     out: &mut impl Write,
@@ -554,7 +628,7 @@ fn aggregate<'a>(
         hex(out, id)?;
         write!(out, ",{},{},{},{},", day, count, event_count, revenue)?;
         if let Some((cat, _)) = best {
-            hex(out, cat)?;
+            hex(out, &category_names[*cat as usize])?;
         }
         writeln!(out)?;
         timings.record(5, write_clock);
@@ -630,13 +704,32 @@ pub fn run() -> io::Result<()> {
         }
         Ok::<_, io::Error>(dims)
     };
+    enum EventIndex {
+        Compact(event_index::Index),
+        Bitmap(Vec<u64>),
+    }
+    let scan_mode = std::env::var("SHOPPING_SESSIONS_EVENT_SCAN").unwrap_or_default();
     let build_index = |index_workers| {
         let started = Instant::now();
-        let repeats = repeat_filter(&event_chunks, index_workers)?;
+        let index = if scan_mode == "two-pass" {
+            EventIndex::Bitmap(repeat_filter(&event_chunks, index_workers)?)
+        } else {
+            match event_index::prepare(&event_chunks, index_workers, scan_mode == "scalar", profile)
+            {
+                Ok(index) => EventIndex::Compact(index),
+                Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                    if profile {
+                        eprintln!("compact index fallback: {error}");
+                    }
+                    EventIndex::Bitmap(repeat_filter(&event_chunks, index_workers)?)
+                }
+                Err(error) => return Err(error),
+            }
+        };
         if profile {
             eprintln!("native event_index {:.6}", started.elapsed().as_secs_f64());
         }
-        Ok::<_, io::Error>(repeats)
+        Ok::<_, io::Error>(index)
     };
     // Dimension construction needs one CPU. The repeat bitmap depends only
     // on event IDs and can use the remaining CPUs within the same budget.
@@ -657,17 +750,21 @@ pub fn run() -> io::Result<()> {
     stage("dimensions_and_index_wall");
     let users = routes();
     let clicks = routes();
-    let index = classify(
-        &event_chunks,
-        &dims,
-        &users,
-        start,
-        end,
-        workers,
-        &repeats,
-        profile,
-    )?;
-    drop(repeats);
+    let index = match repeats {
+        EventIndex::Compact(index) => {
+            event_index::route(index, &event_chunks, &dims, &users, start, end, workers)?
+        }
+        EventIndex::Bitmap(repeats) => classify(
+            &event_chunks,
+            &dims,
+            &users,
+            start,
+            end,
+            workers,
+            &repeats,
+            profile,
+        )?,
+    };
     stage("event_classification");
     route_events(index, &dims, &users, start, end, workers)?;
     stage("event_validate_and_partition");
@@ -692,6 +789,16 @@ pub fn run() -> io::Result<()> {
         })
         .collect();
     partitions.sort_unstable();
+    if profile {
+        let count: usize = partitions.iter().map(|(size, _)| size.0).sum();
+        let at = |i: usize| (partitions[i].0).0;
+        eprintln!(
+            "partition_rows total {count} min {} median {} max {}",
+            at(partitions.len() - 1),
+            at(partitions.len() / 2),
+            at(0)
+        );
+    }
     let next_partition = AtomicUsize::new(0);
     let total_substages = Mutex::new([Duration::ZERO; SUBSTAGES.len()]);
     parallel(workers, workers, |_, i| {
@@ -736,6 +843,7 @@ pub fn run() -> io::Result<()> {
                     person,
                     person_events,
                     person_clicks,
+                    &dims.categories,
                     &mut workspace,
                     &mut totals,
                     &mut out,
@@ -798,15 +906,15 @@ mod tests {
     fn compact_events_retain_exact_slices_and_signed_timestamps() {
         let long = vec![b'x'; usize::from(u16::MAX)];
         let too_long = vec![b'x'; long.len() + 1];
-        let event = Event::new(&long, "カテゴリ".as_bytes(), i64::MIN, 10_000_000).unwrap();
+        let event = Event::new(&long, FIELD_24_MAX, i64::MIN, 10_000_000).unwrap();
         assert_eq!(event.person(), long);
-        assert_eq!(event.category(), "カテゴリ".as_bytes());
+        assert_eq!(event.category(), FIELD_24_MAX);
         assert_eq!(event.timestamp, i64::MIN);
         assert_eq!(event.price(), 10_000_000);
-        assert!(Event::new(&too_long, b"", i64::MAX, 0).is_err());
-        assert!(Event::new(b"person", &too_long, 0, 0).is_err());
-        assert!(Event::new(b"person", b"category", 0, -1).is_err());
-        assert_eq!(std::mem::size_of::<Event<'_>>(), 32);
+        assert!(Event::new(&too_long, 0, i64::MAX, 0).is_err());
+        assert!(Event::new(b"person", FIELD_24_MAX + 1, 0, 0).is_err());
+        assert!(Event::new(b"person", 1, 0, -1).is_err());
+        assert_eq!(std::mem::size_of::<Event<'_>>(), 24);
     }
 
     #[test]

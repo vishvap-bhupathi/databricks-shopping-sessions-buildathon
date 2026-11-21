@@ -6,3 +6,4 @@
 !starter-duckdb/starter-duckdb/native/strict_csv.rs
 !starter-duckdb/starter-duckdb/native/events.rs
 !starter-duckdb/starter-duckdb/native/engine.rs
+!starter-duckdb/starter-duckdb/native/event_index.rs
