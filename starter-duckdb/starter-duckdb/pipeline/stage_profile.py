@@ -24,10 +24,10 @@ class StageProfile:
         if not self.enabled:
             yield None
             return
-        stage = self.stages[name] = {}
+        stage = self.stages.setdefault(name, {"seconds": 0.0})
         start = perf_counter()
         yield stage
-        stage["seconds"] = perf_counter() - start
+        stage["seconds"] += perf_counter() - start
 
     def execute(self, con, name, query, parameters=None):
         if not self.enabled:

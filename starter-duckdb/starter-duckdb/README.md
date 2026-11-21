@@ -37,15 +37,15 @@ If your laptop cannot spare 8 cores and 24 GB, run with lower limits using `make
 To iterate without Docker:
 
 ```sh
-pip install duckdb==1.5.6
+pip install -r requirements.txt polars==2.1.0
 python3 scripts/run_fixtures.py fixtures -- python3 pipeline/pipeline.py
 ```
 
 ## Profiling the baseline
 
-Set `SHOPPING_SESSIONS_PROFILE=1` to emit one JSON record to stderr with stage wall times, available row counts, NDJSON staging sizes, and peak process RSS. Use an external timer to include interpreter startup and process exit. Profiling is off by default.
+Set `SHOPPING_SESSIONS_PROFILE=1` to emit one JSON record to stderr with stage wall times, available row counts, and peak process RSS. Use an external timer to include interpreter startup and process exit. Profiling is off by default.
 
-CSV parsing and NDJSON staging share a timer. Click deduplication and validation run in one SQL statement, and each daily aggregation feeds its Parquet writer in the same statement. To inspect SQL operator timings and cardinalities, also set `SHOPPING_SESSIONS_PROFILE_DIR` to a writable directory outside the scorer output folders. Use a separate diagnostic run for operator profiles. DuckDB operator times can include work across threads and should be reported alongside stage wall times.
+Each DuckDB input load streams nullable text in Arrow batches of up to 32,768 rows. The load timer includes source parsing or row generation and Arrow conversion, which are recorded as nested timings. Timestamp normalization remains in SQL after deduplication. Click deduplication and validation run in one SQL statement, and each daily aggregation feeds its Parquet writer in the same statement. To inspect SQL operator timings and cardinalities, also set `SHOPPING_SESSIONS_PROFILE_DIR` to a writable directory outside the scorer output folders. Use a separate diagnostic run for operator profiles. DuckDB operator times can include work across threads and should be reported alongside stage wall times.
 
 ## Submitting and scoring
 

@@ -22,18 +22,18 @@ EVENT_COLUMNS = (
 CLICK_COLUMNS = ("click_id", "user_id", "campaign_id", "ts")
 
 
-def load_dimensions(con, profile, data, staging):
+def load_dimensions(con, profile, data):
     linked = LinkedUsers()
     with profile.measure("link_parsing_and_union_find"):
         for a, b in csv_rows(sorted((data / "links").glob("*.csv")), 2):
             if a is not None and b is not None:
                 linked.union(a, b)
-    load_rows(con, profile, staging, "aliases", ("user_id", "person_id"), linked.aliases())
+    load_rows(con, profile, "aliases", ("user_id", "person_id"), linked.aliases())
     for table, columns in (
         ("products", ("product_id", "category")),
         ("campaigns", ("campaign_id", "channel")),
     ):
-        load_rows(con, profile, staging, table, columns, csv_rows([data / f"{table}.csv"], 2))
+        load_rows(con, profile, table, columns, csv_rows([data / f"{table}.csv"], 2))
 
 
 def define_timestamp_parser(con):
@@ -59,8 +59,8 @@ def define_timestamp_parser(con):
     """)
 
 
-def clean_events(con, profile, data, staging, window_start, window_end):
-    load_rows(con, profile, staging, "raw_events", EVENT_COLUMNS,
+def clean_events(con, profile, data, window_start, window_end):
+    load_rows(con, profile, "raw_events", EVENT_COLUMNS,
               csv_rows(sorted((data / "events").glob("*.csv")), len(EVENT_COLUMNS)))
     # Materialize the global winner before looking at any validation fields.
     # Fixed-width UTC ingest strings sort chronologically.
@@ -101,8 +101,8 @@ def clean_events(con, profile, data, staging, window_start, window_end):
     con.execute("DROP TABLE event_winners")
 
 
-def clean_clicks(con, profile, data, staging, window_start, window_end):
-    load_rows(con, profile, staging, "raw_clicks", CLICK_COLUMNS,
+def clean_clicks(con, profile, data, window_start, window_end):
+    load_rows(con, profile, "raw_clicks", CLICK_COLUMNS,
               csv_rows(sorted((data / "clicks").glob("*.csv")), len(CLICK_COLUMNS)))
     profile.execute(con, "click_deduplication_validation_and_lookup", """
         CREATE TEMP TABLE clicks AS
@@ -252,12 +252,12 @@ def main():
                 "SELECT timestamp_ms(?), timestamp_ms(?)",
                 [manifest["window_start"], manifest["window_end"]],
             ).fetchone()
-            load_dimensions(con, profile, data, staging)
-            clean_events(con, profile, data, staging, start, end)
+            load_dimensions(con, profile, data)
+            clean_events(con, profile, data, start, end)
             build_sessions(con, profile)
             (output / "user_daily").mkdir(parents=True, exist_ok=True)
             write_user_daily(con, profile, output / "user_daily" / "part-0.parquet")
-            clean_clicks(con, profile, data, staging, start, end)
+            clean_clicks(con, profile, data, start, end)
             (output / "campaign_daily").mkdir(parents=True, exist_ok=True)
             write_campaign_daily(con, profile, output / "campaign_daily" / "part-0.parquet")
 

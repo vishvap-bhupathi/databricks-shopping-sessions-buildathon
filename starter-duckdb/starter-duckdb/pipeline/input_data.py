@@ -1,6 +1,11 @@
-"""Read the challenge CSV dialect and stage parsed values for DuckDB."""
+"""Read the challenge CSV dialect and stream typed batches into DuckDB."""
 
-import json
+from itertools import islice
+
+import pyarrow as pa
+
+
+BATCH_ROWS = 32_768
 
 
 def csv_rows(paths, width):
@@ -54,28 +59,31 @@ class LinkedUsers:
             yield user_id, self.minimum[self.find(user_id)].decode("utf-8")
 
 
-def load_rows(con, profile, directory, table, columns, rows):
-    # JSON escapes embedded CRs, tabs, and control characters without changing
-    # their values. Explicit types also keep IDs and numeric lexemes as strings.
-    path = directory / f"{table}.jsonl"
-    column_types = ", ".join(f"'{name}': 'VARCHAR'" for name in columns)
-    with profile.measure(f"{table}_staging") as stage:
-        with path.open("w", encoding="utf-8") as staged:
-            for row in rows:
-                staged.write(json.dumps(dict(zip(columns, row)), ensure_ascii=False) + "\n")
-        staged_bytes = path.stat().st_size
-        if stage is not None:
-            stage["bytes"] = staged_bytes
-    if staged_bytes:
-        profile.execute(
-            con, f"{table}_load",
-            f"""
-            CREATE TEMP TABLE {table} AS
-            SELECT * FROM read_json(?, format='newline_delimited', columns={{{column_types}}})
-            """,
-            [str(path)],
-        )
-    else:
-        fields = ", ".join(f"{name} VARCHAR" for name in columns)
-        con.execute(f"CREATE TEMP TABLE {table} ({fields})")
-    path.unlink()
+def arrow_batches(rows, schema, profile, table):
+    source = iter(rows)
+    while True:
+        with profile.measure(f"{table}_batch_source"):
+            chunk = list(islice(source, BATCH_ROWS))
+        if not chunk:
+            return
+        with profile.measure(f"{table}_arrow_conversion"):
+            arrays = [pa.array(column, type=field.type)
+                      for column, field in zip(zip(*chunk), schema, strict=True)]
+            batch = pa.RecordBatch.from_arrays(arrays, schema=schema)
+        del chunk
+        yield batch
+
+
+def load_rows(con, profile, table, columns, rows):
+    # Preserve nullable text, including raw numeric and timestamp lexemes.
+    # DuckDB pulls batches into its own spill-managed temporary table.
+    schema = pa.schema([(name, pa.string()) for name in columns])
+    with pa.RecordBatchReader.from_batches(schema, arrow_batches(rows, schema, profile, table)) as reader:
+        con.register("_input_batch_reader", reader)
+        try:
+            profile.execute(
+                con, f"{table}_load",
+                f"CREATE TEMP TABLE {table} AS SELECT * FROM _input_batch_reader",
+            )
+        finally:
+            con.unregister("_input_batch_reader")
