@@ -41,6 +41,12 @@ pip install duckdb==1.5.6
 python3 scripts/run_fixtures.py fixtures -- python3 pipeline/pipeline.py
 ```
 
+## Profiling the baseline
+
+Set `SHOPPING_SESSIONS_PROFILE=1` to emit one JSON record to stderr with stage wall times, available row counts, NDJSON staging sizes, and peak process RSS. Use an external timer to include interpreter startup and process exit. Profiling is off by default.
+
+CSV parsing and NDJSON staging share a timer. Click deduplication and validation run in one SQL statement, and each daily aggregation feeds its Parquet writer in the same statement. To inspect SQL operator timings and cardinalities, also set `SHOPPING_SESSIONS_PROFILE_DIR` to a writable directory outside the scorer output folders. Use a separate diagnostic run for operator profiles. DuckDB operator times can include work across threads and should be reported alongside stage wall times.
+
 ## Submitting and scoring
 
 Submit your public GitHub repository on the Buildathon track page. Enter a commit SHA to score a specific revision, or leave it empty to score the newest commit on the default branch.
