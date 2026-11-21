@@ -51,6 +51,8 @@ The Docker image compiles the event and click CSV reader with Rust at build time
 
 The campaign query credits sessions with a last-click ASOF join and counts assists from merged eligibility intervals and session ranks. Set `SHOPPING_SESSIONS_REFERENCE_ATTRIBUTION=1` to run the original session–click join instead. Run `python3 scripts/test_attribution.py` to compare the two paths on boundary cases and randomized inputs.
 
+The event query aggregates labeled events into session/category rows before writing the daily tables. Set `SHOPPING_SESSIONS_REFERENCE_EVENTS=1` to use the original per-event session tables. Run `python3 scripts/test_event_sessions.py` for boundary and randomized comparisons of session ranks and user-day outputs.
+
 ## Submitting and scoring
 
 Submit your public GitHub repository on the Buildathon track page. Enter a commit SHA to score a specific revision, or leave it empty to score the newest commit on the default branch.

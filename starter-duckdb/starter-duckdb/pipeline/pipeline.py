@@ -9,11 +9,11 @@ import tempfile
 import duckdb
 
 from attribution import LOOKBACK_MS, write_campaign_daily
+from event_sessions import SESSION_GAP_MS, build_session_categories
 from input_data import LinkedUsers, csv_rows, load_csv, load_rows
 from stage_profile import StageProfile
 
 
-SESSION_GAP_MS = 1_800_000
 LATE_MS = 86_400_000
 
 EVENT_COLUMNS = (
@@ -156,8 +156,21 @@ def build_sessions(con, profile):
     """)
 
 
-def write_user_daily(con, profile, destination):
-    profile.execute(con, "user_daily_aggregation_and_parquet", """
+def write_user_daily(con, profile, destination, compact=False):
+    if compact:
+        category_source = """
+            SELECT person_id, cast(make_timestamp_ms(session_start) AS DATE) AS day,
+                   category, purchase_cents
+            FROM session_categories
+        """
+        source_table = "session_categories"
+    else:
+        category_source = """
+            SELECT e.person_id, s.day, e.category, e.purchase_cents
+            FROM session_events e JOIN sessions s USING (person_id, session_number)
+        """
+        source_table = "session_events"
+    profile.execute(con, "user_daily_aggregation_and_parquet", f"""
         COPY (
             WITH daily AS (
                 SELECT person_id, day, count(*) AS sessions,
@@ -166,11 +179,10 @@ def write_user_daily(con, profile, destination):
                 FROM sessions
                 GROUP BY person_id, day
             ), category_revenue AS (
-                SELECT e.person_id, s.day, e.category, sum(e.purchase_cents) AS cents
-                FROM session_events e
-                JOIN sessions s USING (person_id, session_number)
-                WHERE e.purchase_cents IS NOT NULL
-                GROUP BY e.person_id, s.day, e.category
+                SELECT person_id, day, category, sum(purchase_cents) AS cents
+                FROM ({category_source})
+                WHERE purchase_cents IS NOT NULL
+                GROUP BY person_id, day, category
             ), top_categories AS (
                 SELECT person_id, day, category
                 FROM category_revenue
@@ -183,7 +195,7 @@ def write_user_daily(con, profile, destination):
             FROM daily d LEFT JOIN top_categories t USING (person_id, day)
         ) TO ? (FORMAT PARQUET)
     """, [str(destination)])
-    con.execute("DROP TABLE session_events")
+    con.execute(f"DROP TABLE {source_table}")
 
 
 def main():
@@ -211,9 +223,13 @@ def main():
             ).fetchone()
             load_dimensions(con, profile, data)
             clean_events(con, profile, data, start, end)
-            build_sessions(con, profile)
+            compact = os.environ.get("SHOPPING_SESSIONS_REFERENCE_EVENTS") != "1"
+            if compact:
+                build_session_categories(con, profile)
+            else:
+                build_sessions(con, profile)
             (output / "user_daily").mkdir(parents=True, exist_ok=True)
-            write_user_daily(con, profile, output / "user_daily" / "part-0.parquet")
+            write_user_daily(con, profile, output / "user_daily" / "part-0.parquet", compact=compact)
             clean_clicks(con, profile, data, start, end)
             (output / "campaign_daily").mkdir(parents=True, exist_ok=True)
             write_campaign_daily(con, profile, output / "campaign_daily" / "part-0.parquet")
