@@ -1,5 +1,5 @@
 FROM rust:1.85-bookworm@sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098febd68cce8fa7c0bc4 AS parser
-COPY starter-duckdb/starter-duckdb/native/strict_csv.rs /strict_csv.rs
+COPY starter-duckdb/starter-duckdb/native/strict_csv.rs starter-duckdb/starter-duckdb/native/events.rs /
 RUN rustc --crate-type cdylib -O -C panic=abort /strict_csv.rs -o /libstrict_csv.so
 
 FROM python:3.12-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df

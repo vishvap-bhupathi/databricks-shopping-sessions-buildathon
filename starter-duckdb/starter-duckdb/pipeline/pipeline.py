@@ -11,6 +11,7 @@ import duckdb
 from attribution import LOOKBACK_MS, write_campaign_daily
 from event_sessions import SESSION_GAP_MS, build_session_categories
 from input_data import LinkedUsers, csv_rows, load_csv, load_rows
+from native_events import load_native_events
 from stage_profile import StageProfile
 
 
@@ -60,8 +61,10 @@ def define_timestamp_parser(con):
 
 
 def clean_events(con, profile, data, window_start, window_end):
-    load_csv(con, profile, "raw_events", EVENT_COLUMNS,
-             sorted((data / "events").glob("*.csv")))
+    paths = sorted((data / "events").glob("*.csv"))
+    if load_native_events(con, profile, paths, window_start, window_end):
+        return
+    load_csv(con, profile, "raw_events", EVENT_COLUMNS, paths)
     # Materialize the global winner before looking at any validation fields.
     # Fixed-width UTC ingest strings sort chronologically.
     profile.execute(con, "event_deduplication", """

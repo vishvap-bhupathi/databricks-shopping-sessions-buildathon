@@ -157,3 +157,5 @@ pub unsafe extern "C" fn csv_column(batch: *const Batch, index: usize) -> Column
 pub unsafe extern "C" fn csv_batch_free(batch: *mut Batch) {
     drop(Box::from_raw(batch));
 }
+
+mod events;
