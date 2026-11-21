@@ -1,0 +1,64 @@
+# Python environments, bytecode, and tool caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Rust generator build output
+/generator/generator/target/
+
+# Generated datasets and downloaded development answers
+/data/
+/datasets/
+/scratch/
+dev/
+dev-answer/
+
+# Pipeline and benchmark output
+out/
+output/
+benchmark-output/
+benchmark-results/
+benchmarks/results/
+*.parquet
+*.duckdb
+*.duckdb.wal
+*.prof
+*.log
+
+# Downloaded challenge archives
+/*.zip
+/*.tar
+/*.tar.gz
+/*.tgz
+
+# Temporary and editor files
+.DS_Store
+__MACOSX/
+tmp/
+*.tmp
+*.swp
+*~
+
+# Local secrets and credentials
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+.envrc
+.aws/
+.ssh/
+.netrc
+.npmrc
+.pypirc
+credentials.json
+service-account*.json
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
