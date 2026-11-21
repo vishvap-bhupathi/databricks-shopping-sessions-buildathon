@@ -159,3 +159,8 @@ pub unsafe extern "C" fn csv_batch_free(batch: *mut Batch) {
 }
 
 mod events;
+
+#[cfg(native_engine)]
+fn main() -> std::io::Result<()> {
+    events::engine::run()
+}

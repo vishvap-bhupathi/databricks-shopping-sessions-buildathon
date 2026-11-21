@@ -11,6 +11,7 @@ import duckdb
 from attribution import LOOKBACK_MS, write_campaign_daily
 from event_sessions import SESSION_GAP_MS, build_session_categories
 from input_data import LinkedUsers, csv_rows, load_csv, load_rows
+from native_engine import run_engine
 from native_events import load_native_events
 from stage_profile import StageProfile
 
@@ -224,6 +225,9 @@ def main():
                 "SELECT timestamp_ms(?), timestamp_ms(?)",
                 [manifest["window_start"], manifest["window_end"]],
             ).fetchone()
+            if run_engine(con, profile, data, staging, output, start, end, threads):
+                profile.report()
+                return
             load_dimensions(con, profile, data)
             clean_events(con, profile, data, start, end)
             compact = os.environ.get("SHOPPING_SESSIONS_REFERENCE_EVENTS") != "1"

@@ -112,7 +112,12 @@ fn validate<'a>(line: &'a [u8], dimensions: &'a Dimensions, start: i64, end: i64
 {
     let mut fields = [&[][..]; 7];
     if !parse(line, &mut fields) { return None; }
-    let [_, user, ts, ingest, kind, product, price] = fields;
+    validated_fields(fields, dimensions, start, end, datetime(fields[3])?)
+}
+
+fn validated_fields<'a>(fields: [&'a [u8];7], dimensions: &'a Dimensions,
+    start:i64, end:i64, ingest_ms:i64) -> Option<(&'a [u8], i64, Option<i64>, &'a [u8])> {
+    let [_, user, ts, _, kind, product, price] = fields;
     if user.is_empty() || product.is_empty() { return None; }
     let cents = match kind {
         b"view" | b"cart" => None,
@@ -120,7 +125,7 @@ fn validate<'a>(line: &'a [u8], dimensions: &'a Dimensions, start: i64, end: i64
         _ => return None,
     };
     let at = timestamp(ts)?;
-    if at < start || at >= end || at < datetime(ingest)?.checked_sub(DAY_MS)? { return None; }
+    if at < start || at >= end || at < ingest_ms.checked_sub(DAY_MS)? { return None; }
     let person = dimensions.aliases.get(user).map_or(user, |v| v);
     let category = if cents.is_some() {
         dimensions.products.get(product).map_or(&b"unknown"[..], |v| v)
@@ -129,8 +134,12 @@ fn validate<'a>(line: &'a [u8], dimensions: &'a Dimensions, start: i64, end: i64
 }
 
 fn bucket(key: &[u8]) -> usize {
-    let h = key.iter().fold(0xcbf29ce484222325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+    let h = key_hash(key);
     ((h ^ (h >> 32)) as usize) & (PARTITIONS - 1)
+}
+
+fn key_hash(key: &[u8]) -> u64 {
+    key.iter().fold(0xcbf29ce484222325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3))
 }
 
 #[derive(Default)]
@@ -410,3 +419,7 @@ mod tests {
         assert_eq!(timestamp(b"2028-02-29T00:00:00Z\r"), None);
     }
 }
+
+#[cfg(native_engine)]
+#[path = "engine.rs"]
+pub mod engine;
