@@ -1,20 +1,76 @@
 //! User-partitioned execution over immutable, read-only source mappings.
 use super::*;
 use std::io::{BufWriter, Write};
+use std::marker::PhantomData;
 use std::path::Path;
+use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 
 type Id<'a> = &'a [u8];
-type Event<'a> = (i64, i64, Id<'a>);
+// Two borrowed byte ranges plus an integer timestamp and packed metadata.
+#[derive(Clone, Copy)]
+struct Event<'a> {
+    person: *const u8,
+    category: *const u8,
+    timestamp: i64,
+    lengths_and_price: u64,
+    source: PhantomData<&'a [u8]>,
+}
+
+// Both pointers refer to immutable bytes owned by the live input mappings or
+// dimensions. The lifetime prevents workers from outliving those owners.
+unsafe impl Send for Event<'_> {}
+
+impl<'a> Event<'a> {
+    fn new(person: Id<'a>, category: Id<'a>, timestamp: i64, price: i64) -> io::Result<Self> {
+        let (Ok(person_len), Ok(category_len), Ok(price)) = (
+            u16::try_from(person.len()),
+            u16::try_from(category.len()),
+            u32::try_from(price),
+        ) else {
+            return Err(io::Error::other("compact event bounds"));
+        };
+        let lengths_and_price =
+            u64::from(person_len) | (u64::from(category_len) << 16) | (u64::from(price) << 32);
+        Ok(Self {
+            person: person.as_ptr(),
+            category: category.as_ptr(),
+            timestamp,
+            lengths_and_price,
+            source: PhantomData,
+        })
+    }
+
+    fn person(&self) -> Id<'a> {
+        // The constructor records the original contiguous slice length.
+        unsafe { slice::from_raw_parts(self.person, self.lengths_and_price as u16 as usize) }
+    }
+
+    fn category(&self) -> Id<'a> {
+        // The constructor records the original contiguous slice length.
+        unsafe {
+            slice::from_raw_parts(
+                self.category,
+                (self.lengths_and_price >> 16) as u16 as usize,
+            )
+        }
+    }
+
+    fn price(&self) -> i64 {
+        (self.lengths_and_price >> 32) as i64
+    }
+}
+
 type Click<'a> = (i64, Id<'a>, Id<'a>); // time, click ID, campaign
 
 // Move whole batches between stages so workers can sort one user partition
 // at a time using contiguous storage.
 type Routed<'a, T> = (Id<'a>, T);
-type Routes<'a, T> = Vec<Mutex<Vec<Vec<Routed<'a, T>>>>>;
-fn routes<'a, T>() -> Routes<'a, T> {
+type Routes<T> = Vec<Mutex<Vec<Vec<T>>>>;
+fn routes<T>() -> Routes<T> {
     (0..PARTITIONS).map(|_| Mutex::new(Vec::new())).collect()
 }
-fn publish<'a, T>(dest: &Routes<'a, T>, local: &mut [Vec<(Id<'a>, T)>]) {
+fn publish<T>(dest: &Routes<T>, local: &mut [Vec<T>]) {
     for (shard, rows) in dest.iter().zip(local) {
         if !rows.is_empty() {
             shard.lock().unwrap().push(std::mem::take(rows));
@@ -178,52 +234,72 @@ fn repeat_filter(chunks: &[&[u8]], workers: usize) -> io::Result<Vec<u64>> {
     let bytes: usize = chunks.iter().map(|s| s.len()).sum();
     let words = (bytes / 512).clamp(1, 1 << 22).next_power_of_two();
     let mask = words * 64 - 1;
-    let merged = Mutex::new((vec![0u64; words], vec![0u64; words]));
-    let next = AtomicUsize::new(0);
-    parallel(workers, workers, |_, _| {
-        let mut seen = vec![0u64; words];
-        let mut repeated = vec![0u64; words];
-        while let Some(&bytes) = chunks.get(next.fetch_add(1, Ordering::Relaxed)) {
-            if std::str::from_utf8(bytes).is_err() {
-                return Err(io::Error::other("invalid text"));
-            }
-            for line in lines(bytes) {
-                let raw = line.split(|&b| b == b',').next().unwrap();
-                let id = raw
-                    .strip_prefix(b"\"")
-                    .and_then(|s| s.strip_suffix(b"\""))
-                    .unwrap_or(raw);
-                let k = key_hash(id) as usize & mask;
-                let bit = 1u64 << (k % 64);
-                repeated[k / 64] |= seen[k / 64] & bit;
-                seen[k / 64] |= bit;
-            }
+    // A shared packed word stores 32 seen bits and their 32 duplicate bits.
+    // Only contending IDs need the second atomic operation. Waiting for all
+    // workers before decoding the bitmap makes relaxed RMW sufficient.
+    let slots: Vec<_> = (0..words * 2).map(|_| AtomicU64::new(0)).collect();
+    parallel(chunks.len(), workers, |_, i| {
+        let bytes = chunks[i];
+        if std::str::from_utf8(bytes).is_err() {
+            return Err(io::Error::other("invalid text"));
         }
-        let mut shared = merged.lock().unwrap();
-        let (global, duplicates) = &mut *shared;
-        for i in 0..words {
-            duplicates[i] |= repeated[i] | (global[i] & seen[i]);
-            global[i] |= seen[i];
+        for line in lines(bytes) {
+            let raw = line.split(|&b| b == b',').next().unwrap();
+            let id = raw
+                .strip_prefix(b"\"")
+                .and_then(|s| s.strip_suffix(b"\""))
+                .unwrap_or(raw);
+            let k = key_hash(id) as usize & mask;
+            let bit = 1u64 << (k % 32);
+            let word = &slots[k / 32];
+            let previous = word.fetch_or(bit, Ordering::Relaxed);
+            if previous & bit != 0 && previous & (bit << 32) == 0 {
+                word.fetch_or(bit << 32, Ordering::Relaxed);
+            }
         }
         Ok(())
     })?;
-    Ok(merged.into_inner().unwrap().1)
+    Ok(slots
+        .chunks_exact(2)
+        .map(|words| {
+            (words[0].load(Ordering::Relaxed) >> 32)
+                | (words[1].load(Ordering::Relaxed) & 0xffff_ffff_0000_0000)
+        })
+        .collect())
+}
+
+const CLASSIFY_STAGES: [&str; 6] = [
+    "csv_structure",
+    "ingest_timestamp",
+    "id_hash_and_bitmap",
+    "validation_and_lookups",
+    "user_buffer_push",
+    "batch_publish",
+];
+
+fn record_time(duration: &mut Duration, start: Option<Instant>) {
+    if let Some(start) = start {
+        *duration += start.elapsed();
+    }
 }
 
 fn classify<'a>(
     chunks: &[&'a [u8]],
     dims: &'a Dimensions,
-    users: &Routes<'a, Event<'a>>,
+    users: &Routes<Event<'a>>,
     start: i64,
     end: i64,
     workers: usize,
     repeats: &[u64],
+    profile: bool,
 ) -> io::Result<Vec<Partition<'a>>> {
     let mask = repeats.len() * 64 - 1;
     let duplicates: Vec<Mutex<Partition>> =
         (0..PARTITIONS).map(|_| Mutex::new(Vec::new())).collect();
     let count = AtomicUsize::new(0);
+    let stage_totals = Mutex::new([Duration::ZERO; CLASSIFY_STAGES.len()]);
     parallel(chunks.len(), workers, |_, i| {
+        let mut subtimes = [Duration::ZERO; CLASSIFY_STAGES.len()];
         let mut routes = vec![Vec::new(); PARTITIONS];
         let mut uncertain = vec![Vec::new(); PARTITIONS];
         for (n, line) in lines(chunks[i]).enumerate() {
@@ -231,26 +307,49 @@ fn classify<'a>(
                 if count.fetch_add(ROUTE_BATCH_ROWS, Ordering::Relaxed) >= MAX_INDEXED_ROWS {
                     return Err(io::Error::other("event row guard"));
                 }
+                let clock = profile.then(Instant::now);
                 publish(users, &mut routes);
+                record_time(&mut subtimes[5], clock);
             }
+            let sample = profile && n % 1024 == 0;
+            let clock = sample.then(Instant::now);
             let mut fields = [&[][..]; 7];
-            if !parse(line, &mut fields) || fields[0].is_empty() {
+            let valid = parse(line, &mut fields);
+            record_time(&mut subtimes[0], clock);
+            if !valid || fields[0].is_empty() {
                 continue;
             }
+            let clock = sample.then(Instant::now);
             let ingest = datetime(fields[3])
                 .filter(|_| fields[3].len() == 20)
                 .ok_or_else(|| io::Error::other("invalid ingest"))?;
+            record_time(&mut subtimes[1], clock);
+            let clock = sample.then(Instant::now);
             let hash = key_hash(fields[0]);
             let k = hash as usize & mask;
-            if repeats[k / 64] & (1u64 << (k % 64)) != 0 {
+            let repeat = repeats[k / 64] & (1u64 << (k % 64)) != 0;
+            record_time(&mut subtimes[2], clock);
+            if repeat {
                 uncertain[((hash ^ (hash >> 32)) as usize) & (PARTITIONS - 1)].push(line);
-            } else if let Some((id, t, price, cat)) =
-                validated_fields(fields, dims, start, end, ingest)
-            {
-                routes[bucket(id)].push((id, (t, price.unwrap_or(0), cat)));
+            } else {
+                let clock = sample.then(Instant::now);
+                let event = validated_fields(fields, dims, start, end, ingest);
+                record_time(&mut subtimes[3], clock);
+                if let Some((id, t, price, cat)) = event {
+                    let clock = sample.then(Instant::now);
+                    routes[bucket(id)].push(Event::new(id, cat, t, price.unwrap_or(0))?);
+                    record_time(&mut subtimes[4], clock);
+                }
             }
         }
+        let clock = profile.then(Instant::now);
         publish(users, &mut routes);
+        record_time(&mut subtimes[5], clock);
+        if profile {
+            for (total, duration) in stage_totals.lock().unwrap().iter_mut().zip(subtimes) {
+                *total += duration;
+            }
+        }
         for (dst, rows) in duplicates.iter().zip(uncertain) {
             if !rows.is_empty() {
                 dst.lock().unwrap().push(rows);
@@ -258,6 +357,14 @@ fn classify<'a>(
         }
         Ok(())
     })?;
+    if profile {
+        for (name, elapsed) in CLASSIFY_STAGES
+            .iter()
+            .zip(stage_totals.into_inner().unwrap())
+        {
+            eprintln!("classify_sample {} {:.6}", name, elapsed.as_secs_f64());
+        }
+    }
     Ok(duplicates
         .into_iter()
         .map(|m| m.into_inner().unwrap())
@@ -267,7 +374,7 @@ fn classify<'a>(
 fn route_events<'a>(
     index: Vec<Partition<'a>>,
     dims: &'a Dimensions,
-    users: &Routes<'a, Event<'a>>,
+    users: &Routes<Event<'a>>,
     start: i64,
     end: i64,
     workers: usize,
@@ -289,7 +396,7 @@ fn route_events<'a>(
         let mut routes = vec![Vec::new(); PARTITIONS];
         for (_, line) in winners.into_values() {
             if let Some((id, t, price, cat)) = validate(line, dims, start, end) {
-                routes[bucket(id)].push((id, (t, price.unwrap_or(0), cat)));
+                routes[bucket(id)].push(Event::new(id, cat, t, price.unwrap_or(0))?);
             }
         }
         publish(users, &mut routes);
@@ -301,7 +408,7 @@ fn route_clicks<'a>(
     chunks: &[&'a [u8]],
     dims: &'a Dimensions,
     campaigns: &HashMap<Id, Id>,
-    users: &Routes<'a, Click<'a>>,
+    users: &Routes<Routed<'a, Click<'a>>>,
     start: i64,
     end: i64,
     workers: usize,
@@ -355,13 +462,41 @@ struct Workspace<'a> {
     ends: HashMap<Id<'a>, i64>,
 }
 
+const SUBSTAGES: [&str; 8] = [
+    "partition_prepare",
+    "event_sort",
+    "click_sort_dedup",
+    "user_group",
+    "session_credit_and_category",
+    "user_row_serialization",
+    "assists",
+    "campaign_serialization",
+];
+
+#[derive(Default)]
+struct Timings {
+    enabled: bool,
+    elapsed: [Duration; SUBSTAGES.len()],
+}
+impl Timings {
+    fn start(&self) -> Option<Instant> {
+        self.enabled.then(Instant::now)
+    }
+    fn record(&mut self, stage: usize, start: Option<Instant>) {
+        if let Some(start) = start {
+            self.elapsed[stage] += start.elapsed();
+        }
+    }
+}
+
 fn aggregate<'a>(
     id: Id,
-    events: &[Routed<'a, Event<'a>>],
+    events: &[Event<'a>],
     clicks: &[Routed<'a, Click<'a>>],
     workspace: &mut Workspace<'a>,
     totals: &mut Totals<'a>,
     out: &mut impl Write,
+    timings: &mut Timings,
 ) -> io::Result<()> {
     let Workspace {
         starts,
@@ -373,11 +508,12 @@ fn aggregate<'a>(
     let (mut i, mut j) = (0, 0);
     let mut credit: Option<Click> = None;
     while i < events.len() {
-        let day = events[i].1 .0.div_euclid(DAY_MS);
+        let session_clock = timings.start();
+        let day = events[i].timestamp.div_euclid(DAY_MS);
         let (mut count, mut event_count, mut revenue) = (0i64, 0i64, 0i64);
         categories.clear();
-        while i < events.len() && events[i].1 .0.div_euclid(DAY_MS) == day {
-            let start = events[i].1 .0;
+        while i < events.len() && events[i].timestamp.div_euclid(DAY_MS) == day {
+            let start = events[i].timestamp;
             starts.push(start);
             while j < clicks.len() && clicks[j].1 .0 <= start {
                 let click = clicks[j].1;
@@ -391,14 +527,15 @@ fn aggregate<'a>(
                 .map_or(&b"organic"[..], |c| c.2);
             let mut session_revenue = 0;
             loop {
-                let (t, price, cat) = events[i].1;
+                let t = events[i].timestamp;
+                let price = events[i].price();
                 if price > 0 {
-                    *categories.entry(cat).or_default() += price;
+                    *categories.entry(events[i].category()).or_default() += price;
                     session_revenue += price;
                 }
                 event_count += 1;
                 i += 1;
-                if i == events.len() || events[i].1 .0 > t.saturating_add(1_800_000) {
+                if i == events.len() || events[i].timestamp > t.saturating_add(1_800_000) {
                     break;
                 }
             }
@@ -412,13 +549,17 @@ fn aggregate<'a>(
         let best = categories
             .iter()
             .max_by(|(a, x), (b, y)| x.cmp(y).then_with(|| b.cmp(a)));
+        timings.record(4, session_clock);
+        let write_clock = timings.start();
         hex(out, id)?;
         write!(out, ",{},{},{},{},", day, count, event_count, revenue)?;
         if let Some((cat, _)) = best {
             hex(out, cat)?;
         }
         writeln!(out)?;
+        timings.record(5, write_clock);
     }
+    let assist_clock = timings.start();
     for &(_, (t, _, campaign)) in clicks {
         let end = t.saturating_add(WEEK);
         let previous = ends.insert(campaign, end);
@@ -432,13 +573,11 @@ fn aggregate<'a>(
             pos += n;
         }
     }
+    timings.record(6, assist_clock);
     Ok(())
 }
 
-fn drain_partition<'a, T>(
-    routes: &Routes<'a, T>,
-    partition: usize,
-) -> io::Result<Vec<Routed<'a, T>>> {
+fn drain_partition<T>(routes: &Routes<T>, partition: usize) -> io::Result<Vec<T>> {
     let chunks = std::mem::take(&mut *routes[partition].lock().unwrap());
     let rows: usize = chunks.iter().map(Vec::len).sum();
     if rows > MAX_USER_PARTITION_ROWS {
@@ -477,20 +616,57 @@ pub fn run() -> io::Result<()> {
         }
         clock = Instant::now();
     };
-    let dims = dimensions(data)?;
+    let event_maps = files(&data.join("events"))?;
+    let event_chunks = chunks(&event_maps);
+    stage("event_map_and_chunk");
+    let build_dimensions = || {
+        let started = Instant::now();
+        let dims = dimensions(data)?;
+        if profile {
+            eprintln!(
+                "native identity_and_dimensions {:.6}",
+                started.elapsed().as_secs_f64()
+            );
+        }
+        Ok::<_, io::Error>(dims)
+    };
+    let build_index = |index_workers| {
+        let started = Instant::now();
+        let repeats = repeat_filter(&event_chunks, index_workers)?;
+        if profile {
+            eprintln!("native event_index {:.6}", started.elapsed().as_secs_f64());
+        }
+        Ok::<_, io::Error>(repeats)
+    };
+    // Dimension construction needs one CPU. The repeat bitmap depends only
+    // on event IDs and can use the remaining CPUs within the same budget.
+    let (dims, repeats) = if workers > 1 {
+        thread::scope(|scope| {
+            let index = scope.spawn(|| build_index(workers - 1));
+            let dims = build_dimensions();
+            Ok::<_, io::Error>((dims?, index.join().unwrap()?))
+        })?
+    } else {
+        (build_dimensions()?, build_index(workers)?)
+    };
     let catalog = Mapping::open(&data.join("campaigns.csv"))?;
     let campaigns: HashMap<_, _> = records(rows(catalog.bytes()))
         .filter(|[id, _]| !id.is_empty())
         .map(|[id, ch]| (id, ch))
         .collect();
-    stage("identity_and_dimensions");
-    let event_maps = files(&data.join("events"))?;
-    let event_chunks = chunks(&event_maps);
-    let repeats = repeat_filter(&event_chunks, workers)?;
-    stage("event_index");
+    stage("dimensions_and_index_wall");
     let users = routes();
     let clicks = routes();
-    let index = classify(&event_chunks, &dims, &users, start, end, workers, &repeats)?;
+    let index = classify(
+        &event_chunks,
+        &dims,
+        &users,
+        start,
+        end,
+        workers,
+        &repeats,
+        profile,
+    )?;
     drop(repeats);
     stage("event_classification");
     route_events(index, &dims, &users, start, end, workers)?;
@@ -506,25 +682,56 @@ pub fn run() -> io::Result<()> {
         workers,
     )?;
     stage("click_partition");
+    // Process the largest partitions first so a skewed partition cannot
+    // become the final worker's entire tail.
+    let mut partitions: Vec<_> = (0..PARTITIONS)
+        .map(|partition| {
+            let event_rows: usize = users[partition].lock().unwrap().iter().map(Vec::len).sum();
+            let click_rows: usize = clicks[partition].lock().unwrap().iter().map(Vec::len).sum();
+            (std::cmp::Reverse(event_rows + click_rows), partition)
+        })
+        .collect();
+    partitions.sort_unstable();
+    let next_partition = AtomicUsize::new(0);
+    let total_substages = Mutex::new([Duration::ZERO; SUBSTAGES.len()]);
     parallel(workers, workers, |_, i| {
+        let worker_start = profile.then(Instant::now);
+        let mut timings = Timings::default();
         let mut out = BufWriter::new(File::create(scratch.join(format!("user-{i}.csv")))?);
         let mut totals = Totals::new();
         let mut workspace = Workspace::default();
-        for partition in (i..PARTITIONS).step_by(workers) {
+        while let Some(&(_, partition)) =
+            partitions.get(next_partition.fetch_add(1, Ordering::Relaxed))
+        {
+            timings.enabled = profile;
+            let prepare_clock = timings.start();
             let mut events = drain_partition(&users, partition)?;
             let mut history = drain_partition(&clicks, partition)?;
-            events.sort_unstable_by(|a, b| a.0.cmp(b.0).then_with(|| a.1 .0.cmp(&b.1 .0)));
+            timings.record(0, prepare_clock);
+            let sort_clock = timings.start();
+            events.sort_unstable_by(|a, b| {
+                a.person()
+                    .cmp(b.person())
+                    .then_with(|| a.timestamp.cmp(&b.timestamp))
+            });
+            timings.record(1, sort_clock);
+            let sort_clock = timings.start();
             history.sort_unstable();
             // All copies of a click are identical and route to the same user.
             history.dedup();
+            timings.record(2, sort_clock);
+            // Sample four evenly spaced groups of partitions to limit clock overhead.
+            timings.enabled = profile && (partition / workers) % 8 == 0;
             let mut remaining_clicks = history.as_slice();
-            for person_events in events.chunk_by(|a, b| a.0 == b.0) {
-                let person = person_events[0].0;
+            for person_events in events.chunk_by(|a, b| a.person() == b.person()) {
+                let group_clock = timings.start();
+                let person = person_events[0].person();
                 let from = remaining_clicks.partition_point(|row| row.0 < person);
                 remaining_clicks = &remaining_clicks[from..];
                 let through = remaining_clicks.partition_point(|row| row.0 == person);
                 let (person_clicks, remaining) = remaining_clicks.split_at(through);
                 remaining_clicks = remaining;
+                timings.record(3, group_clock);
                 aggregate(
                     person,
                     person_events,
@@ -532,10 +739,13 @@ pub fn run() -> io::Result<()> {
                     &mut workspace,
                     &mut totals,
                     &mut out,
+                    &mut timings,
                 )?;
             }
         }
         out.flush()?;
+        timings.enabled = profile;
+        let write_clock = timings.start();
         let mut out = BufWriter::new(File::create(scratch.join(format!("campaign-{i}.csv")))?);
         for ((id, day), v) in totals {
             hex(&mut out, id)?;
@@ -554,15 +764,50 @@ pub fn run() -> io::Result<()> {
                 day, v.sessions, v.purchasing, v.revenue, v.assists
             )?;
         }
-        out.flush()
+        out.flush()?;
+        timings.record(7, write_clock);
+        if profile {
+            for (total, duration) in total_substages
+                .lock()
+                .unwrap()
+                .iter_mut()
+                .zip(timings.elapsed)
+            {
+                *total += duration;
+            }
+        }
+        if let Some(start) = worker_start {
+            eprintln!("worker {} {:.6}", i, start.elapsed().as_secs_f64());
+        }
+        Ok(())
     })?;
     stage("session_attribution_and_aggregate_staging");
+    if profile {
+        for (name, elapsed) in SUBSTAGES.iter().zip(total_substages.into_inner().unwrap()) {
+            eprintln!("substage {} {:.6}", name, elapsed.as_secs_f64());
+        }
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_events_retain_exact_slices_and_signed_timestamps() {
+        let long = vec![b'x'; usize::from(u16::MAX)];
+        let too_long = vec![b'x'; long.len() + 1];
+        let event = Event::new(&long, "カテゴリ".as_bytes(), i64::MIN, 10_000_000).unwrap();
+        assert_eq!(event.person(), long);
+        assert_eq!(event.category(), "カテゴリ".as_bytes());
+        assert_eq!(event.timestamp, i64::MIN);
+        assert_eq!(event.price(), 10_000_000);
+        assert!(Event::new(&too_long, b"", i64::MAX, 0).is_err());
+        assert!(Event::new(b"person", &too_long, 0, 0).is_err());
+        assert!(Event::new(b"person", b"category", 0, -1).is_err());
+        assert_eq!(std::mem::size_of::<Event<'_>>(), 32);
+    }
 
     #[test]
     fn physical_lines_preserve_cr_and_unterminated_tail() {
@@ -586,7 +831,10 @@ mod tests {
             .find(|s| bit(s.as_bytes()) == bit(original))
             .unwrap();
         let data = format!("one,x\n{other},x");
-        assert_ne!(repeat_filter(&[data.as_bytes()], 2).unwrap()[0] & bit(original), 0);
+        assert_ne!(
+            repeat_filter(&[data.as_bytes()], 2).unwrap()[0] & bit(original),
+            0
+        );
         assert_eq!(repeat_filter(&[b"one,x"], 2).unwrap()[0], 0);
     }
 }

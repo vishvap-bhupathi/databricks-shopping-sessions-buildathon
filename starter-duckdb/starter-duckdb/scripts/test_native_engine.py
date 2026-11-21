@@ -11,6 +11,34 @@ import duckdb
 
 @unittest.skipUnless(Path("/app/native-engine").exists(), "requires the native engine image")
 class EngineTest(unittest.TestCase):
+    def test_oversized_id_uses_exact_fallback(self):
+        person = "猫" * 22_000
+        with tempfile.TemporaryDirectory() as directory, duckdb.connect() as con:
+            root = Path(directory)
+            (root / "events").mkdir()
+            (root / "manifest.json").write_text(
+                '{"window_start":"2026-10-03T00:00:00Z","window_end":"2026-10-07T00:00:00Z"}'
+            )
+            (root / "events/a.csv").write_text(
+                f"event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents\n"
+                f"event,{person},2026-10-03T00:00:00Z,2026-10-03T00:00:00Z,purchase,p1,250\n",
+                encoding="utf-8",
+            )
+            (root / "products.csv").write_text("product_id,category\np1,books\n")
+            (root / "campaigns.csv").write_text("campaign_id,channel\n")
+            output = root / "output"
+            env = dict(os.environ, DATA_DIR=str(root), SCRATCH_DIR=str(root / "scratch"),
+                       OUTPUT_DIR=str(output), SHOPPING_SESSIONS_REFERENCE_ENGINE="0")
+            result = subprocess.run(["/app/run.sh"], env=env, capture_output=True,
+                                    check=True, text=True)
+            self.assertIn("compact event bounds", result.stderr)
+            user = con.read_parquet(str(output / "user_daily" / "part-0.parquet"))
+            self.assertEqual(user.project("user_id, events, revenue_cents, top_category").fetchall(),
+                             [(person, 1, 250, "books")])
+            campaign = con.read_parquet(str(output / "campaign_daily" / "part-0.parquet"))
+            self.assertEqual(campaign.project("campaign_id, sessions, assisted_sessions").fetchall(),
+                             [("organic", 1, 0)])
+
     def test_differential(self):
         start = 1790985600000
         with tempfile.TemporaryDirectory() as directory, duckdb.connect() as con:
