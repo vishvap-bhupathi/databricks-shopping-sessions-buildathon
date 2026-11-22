@@ -110,10 +110,29 @@ fn publish<T>(dest: &Routes<T>, local: &mut [Vec<T>]) {
         }
     }
 }
+
+fn routed_storage<T>(routes: &Routes<T>) -> (usize, usize) {
+    let (mut rows, mut capacity) = (0, 0);
+    for partition in routes {
+        for chunk in partition.lock().unwrap().iter() {
+            rows += chunk.len();
+            capacity += chunk.capacity();
+        }
+    }
+    (rows, capacity * std::mem::size_of::<T>())
+}
+
 const WEEK: i64 = 7 * DAY_MS;
 const ROUTE_BATCH_ROWS: usize = 32_768;
 const MAX_CLICK_ROWS: usize = 32_000_000;
 const MAX_USER_PARTITION_ROWS: usize = 2_000_000;
+
+// Charge complete batches and the actual tail of each chunk. Rounding
+// every chunk up could exhaust the budget while many rows remained unused.
+fn claim_rows(total: &AtomicUsize, count: usize, limit: usize) -> bool {
+    count == 0
+        || (count <= limit && total.fetch_add(count, Ordering::Relaxed) <= limit - count)
+}
 
 fn files(path: &Path) -> io::Result<Vec<Mapping>> {
     if !path.exists() {
@@ -377,9 +396,12 @@ fn classify<'a>(
         let mut subtimes = [Duration::ZERO; CLASSIFY_STAGES.len()];
         let mut routes = vec![Vec::new(); PARTITIONS];
         let mut uncertain = vec![Vec::new(); PARTITIONS];
-        for (n, line) in lines(chunks[i]).enumerate() {
-            if n % ROUTE_BATCH_ROWS == 0 {
-                if count.fetch_add(ROUTE_BATCH_ROWS, Ordering::Relaxed) >= MAX_INDEXED_ROWS {
+        let mut scanned = 0;
+        for line in lines(chunks[i]) {
+            let n = scanned;
+            scanned += 1;
+            if scanned % ROUTE_BATCH_ROWS == 0 {
+                if !claim_rows(&count, ROUTE_BATCH_ROWS, MAX_INDEXED_ROWS) {
                     return Err(io::Error::other("event row guard"));
                 }
                 let clock = profile.then(Instant::now);
@@ -416,6 +438,9 @@ fn classify<'a>(
                     record_time(&mut subtimes[4], clock);
                 }
             }
+        }
+        if !claim_rows(&count, scanned % ROUTE_BATCH_ROWS, MAX_INDEXED_ROWS) {
+            return Err(io::Error::other("event row guard"));
         }
         let clock = profile.then(Instant::now);
         publish(users, &mut routes);
@@ -457,16 +482,16 @@ fn route_events<'a>(
     let index: Vec<_> = index.into_iter().map(Mutex::new).collect();
     parallel(index.len(), workers, |_, i| {
         let chunks = std::mem::take(&mut *index[i].lock().unwrap());
-        let n = chunks.iter().map(Vec::len).sum();
-        if n > MAX_PARTITION_ROWS {
-            return Err(io::Error::other("event partition guard"));
-        }
-        let mut winners = HashMap::with_capacity(n);
+        let n: usize = chunks.iter().map(Vec::len).sum();
+        let mut winners = HashMap::with_capacity(n.min(MAX_PARTITION_ROWS).min(65_536));
         for line in chunks.into_iter().flatten() {
             let mut columns = line.splitn(5, |&c| c == b',');
             let id = unquote(columns.next().unwrap());
             let ingest = unquote(columns.nth(2).unwrap());
             keep_winner(&mut winners, id, ingest, line);
+            if winners.len() > MAX_PARTITION_ROWS {
+                return Err(io::Error::other("distinct event partition guard"));
+            }
         }
         let mut routes = vec![Vec::new(); PARTITIONS];
         for (_, line) in winners.into_values() {
@@ -497,9 +522,11 @@ struct ClickWork<'a> {
 impl ClickWork<'_> {
     fn route_chunk(&self, i: usize) -> io::Result<()> {
         let mut routes = vec![Vec::new(); PARTITIONS];
-        for (n, [click, id, campaign, ts]) in records(self.chunks[i]).enumerate() {
-            if n % ROUTE_BATCH_ROWS == 0 {
-                if self.count.fetch_add(ROUTE_BATCH_ROWS, Ordering::Relaxed) >= MAX_CLICK_ROWS {
+        let mut scanned = 0;
+        for [click, id, campaign, ts] in records(self.chunks[i]) {
+            scanned += 1;
+            if scanned % ROUTE_BATCH_ROWS == 0 {
+                if !claim_rows(&self.count, ROUTE_BATCH_ROWS, MAX_CLICK_ROWS) {
                     return Err(io::Error::other("click row guard"));
                 }
                 publish(self.users, &mut routes);
@@ -513,6 +540,9 @@ impl ClickWork<'_> {
                 let person = self.dims.person(id);
                 routes[bucket(person)].push((person, (t, click, campaign)));
             }
+        }
+        if !claim_rows(&self.count, scanned % ROUTE_BATCH_ROWS, MAX_CLICK_ROWS) {
+            return Err(io::Error::other("click row guard"));
         }
         publish(self.users, &mut routes);
         Ok(())
@@ -670,17 +700,68 @@ fn aggregate<'a>(
     Ok(())
 }
 
-fn drain_partition<T>(routes: &Routes<T>, partition: usize) -> io::Result<Vec<T>> {
-    let chunks = std::mem::take(&mut *routes[partition].lock().unwrap());
-    let rows: usize = chunks.iter().map(Vec::len).sum();
-    if rows > MAX_USER_PARTITION_ROWS {
-        return Err(io::Error::other("user partition guard"));
-    }
-    let mut rows = Vec::with_capacity(rows);
+fn flatten_partition<T>(chunks: Vec<Vec<T>>, count: usize) -> Vec<T> {
+    let mut rows = Vec::with_capacity(count);
     for mut chunk in chunks {
         rows.append(&mut chunk);
     }
-    Ok(rows)
+    rows
+}
+
+const USER_SUBPARTITIONS: usize = 32;
+const MAX_USER_REPARTITION_BYTES: usize = 128 * 1024 * 1024;
+
+fn split_user_partition<'a, T>(
+    chunks: Vec<Vec<T>>,
+    person: impl Fn(&T) -> Id<'a>,
+    limit: usize,
+) -> io::Result<[Vec<T>; USER_SUBPARTITIONS]> {
+    // The primary route folds the high and low halves of the hash together.
+    // Use the high half alone to obtain a different partition of those rows.
+    let shard = |row: &T| (key_hash(person(row)) >> 32) as usize & (USER_SUBPARTITIONS - 1);
+    let mut counts = [0; USER_SUBPARTITIONS];
+    for row in chunks.iter().flatten() {
+        counts[shard(row)] += 1;
+    }
+    if counts.iter().any(|&count| count > limit) {
+        return Err(io::Error::other("user partition guard after repartition"));
+    }
+    let mut partitions = counts.map(Vec::with_capacity);
+    for row in chunks.into_iter().flatten() {
+        partitions[shard(&row)].push(row);
+    }
+    Ok(partitions)
+}
+
+fn visit_user_partition<'a>(
+    event_chunks: Vec<Vec<Event<'a>>>,
+    click_chunks: Vec<Vec<Routed<'a, Click<'a>>>>,
+    limit: usize,
+    mut visit: impl FnMut(Vec<Event<'a>>, Vec<Routed<'a, Click<'a>>>) -> io::Result<()>,
+) -> io::Result<bool> {
+    let event_count = event_chunks.iter().map(Vec::len).sum();
+    let click_count = click_chunks.iter().map(Vec::len).sum();
+    if event_count <= limit && click_count <= limit {
+        visit(
+            flatten_partition(event_chunks, event_count),
+            flatten_partition(click_chunks, click_count),
+        )?;
+        return Ok(false);
+    }
+    let additional_bytes = event_count
+        .saturating_mul(std::mem::size_of::<Event<'_>>())
+        .saturating_add(click_count.saturating_mul(std::mem::size_of::<Routed<'_, Click<'_>>>()));
+    if additional_bytes > MAX_USER_REPARTITION_BYTES {
+        return Err(io::Error::other("user repartition memory guard"));
+    }
+    let events = split_user_partition(event_chunks, Event::person, limit)?;
+    let clicks = split_user_partition(click_chunks, |row| row.0, limit)?;
+    for (events, clicks) in IntoIterator::into_iter(events).zip(clicks) {
+        if !events.is_empty() {
+            visit(events, clicks)?;
+        }
+    }
+    Ok(true)
 }
 
 pub fn run() -> io::Result<()> {
@@ -720,6 +801,14 @@ pub fn run() -> io::Result<()> {
             eprintln!(
                 "native identity_and_dimensions {:.6}",
                 started.elapsed().as_secs_f64()
+            );
+            eprintln!(
+                "alias_table rows {} capacity {} canonical_slots {} product_rows {} product_capacity {}",
+                dims.aliases.len(),
+                dims.aliases.capacity(),
+                dims.canonical.capacity(),
+                dims.products.len(),
+                dims.products.capacity()
             );
         }
         Ok::<_, io::Error>(dims)
@@ -839,6 +928,11 @@ pub fn run() -> io::Result<()> {
     if profile {
         let count: usize = partitions.iter().map(|(size, _)| size.0).sum();
         let at = |i: usize| (partitions[i].0).0;
+        let (event_rows, event_capacity) = routed_storage(&users);
+        let (click_rows, click_capacity) = routed_storage(&clicks);
+        eprintln!(
+            "route_storage event_rows {event_rows} event_capacity_bytes {event_capacity} click_rows {click_rows} click_capacity_bytes {click_capacity}"
+        );
         eprintln!(
             "partition_rows total {count} min {} median {} max {}",
             at(partitions.len() - 1),
@@ -859,43 +953,56 @@ pub fn run() -> io::Result<()> {
         {
             timings.enabled = profile;
             let prepare_clock = timings.start();
-            let mut events = drain_partition(&users, partition)?;
-            let mut history = drain_partition(&clicks, partition)?;
-            timings.record(0, prepare_clock);
-            let sort_clock = timings.start();
-            events.sort_unstable_by(|a, b| {
-                a.person()
-                    .cmp(b.person())
-                    .then_with(|| a.timestamp.cmp(&b.timestamp))
-            });
-            timings.record(1, sort_clock);
-            let sort_clock = timings.start();
-            history.sort_unstable();
-            // All copies of a click are identical and route to the same user.
-            history.dedup();
-            timings.record(2, sort_clock);
-            // Sample four evenly spaced groups of partitions to limit clock overhead.
-            timings.enabled = profile && (partition / workers) % 8 == 0;
-            let mut remaining_clicks = history.as_slice();
-            for person_events in events.chunk_by(|a, b| a.person() == b.person()) {
-                let group_clock = timings.start();
-                let person = person_events[0].person();
-                let from = remaining_clicks.partition_point(|row| row.0 < person);
-                remaining_clicks = &remaining_clicks[from..];
-                let through = remaining_clicks.partition_point(|row| row.0 == person);
-                let (person_clicks, remaining) = remaining_clicks.split_at(through);
-                remaining_clicks = remaining;
-                timings.record(3, group_clock);
-                aggregate(
-                    person,
-                    person_events,
-                    person_clicks,
-                    &dims.categories,
-                    &mut workspace,
-                    &mut totals,
-                    &mut out,
-                    &mut timings,
-                )?;
+            let event_chunks = std::mem::take(&mut *users[partition].lock().unwrap());
+            let click_chunks = std::mem::take(&mut *clicks[partition].lock().unwrap());
+            let mut prepare_clock = prepare_clock;
+            let split = visit_user_partition(
+                event_chunks,
+                click_chunks,
+                MAX_USER_PARTITION_ROWS,
+                |mut events, mut history| {
+                    timings.enabled = profile;
+                    timings.record(0, prepare_clock.take());
+                    let sort_clock = timings.start();
+                    events.sort_unstable_by(|a, b| {
+                        a.person()
+                            .cmp(b.person())
+                            .then_with(|| a.timestamp.cmp(&b.timestamp))
+                    });
+                    timings.record(1, sort_clock);
+                    let sort_clock = timings.start();
+                    history.sort_unstable();
+                    // All copies of a click are identical and route to the same user.
+                    history.dedup();
+                    timings.record(2, sort_clock);
+                    // Sample four evenly spaced groups of partitions to limit clock overhead.
+                    timings.enabled = profile && (partition / workers) % 8 == 0;
+                    let mut remaining_clicks = history.as_slice();
+                    for person_events in events.chunk_by(|a, b| a.person() == b.person()) {
+                        let group_clock = timings.start();
+                        let person = person_events[0].person();
+                        let from = remaining_clicks.partition_point(|row| row.0 < person);
+                        remaining_clicks = &remaining_clicks[from..];
+                        let through = remaining_clicks.partition_point(|row| row.0 == person);
+                        let (person_clicks, remaining) = remaining_clicks.split_at(through);
+                        remaining_clicks = remaining;
+                        timings.record(3, group_clock);
+                        aggregate(
+                            person,
+                            person_events,
+                            person_clicks,
+                            &dims.categories,
+                            &mut workspace,
+                            &mut totals,
+                            &mut out,
+                            &mut timings,
+                        )?;
+                    }
+                    Ok(())
+                },
+            )?;
+            if split && profile {
+                eprintln!("repartitioned_user_partition {partition}");
             }
         }
         out.flush()?;
@@ -948,6 +1055,56 @@ pub fn run() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_user_partition_splits_both_histories_by_exact_person() {
+        let first = b"first";
+        let second = (0..)
+            .map(|i| format!("other-{i}"))
+            .find(|id| {
+                let bytes = id.as_bytes();
+                bucket(bytes) == bucket(first)
+                    && ((key_hash(bytes) ^ key_hash(first)) >> 32) & 31 != 0
+            })
+            .unwrap();
+        let second = second.as_bytes();
+        let x = Event::new(first, 1, 0, 2).unwrap();
+        let y = Event::new(second, 2, 1, 3).unwrap();
+        let click = (0, &b"click"[..], &b"campaign"[..]);
+        let mut visited = 0;
+        assert!(visit_user_partition(
+            vec![vec![x, y], vec![y, x]],
+            vec![vec![(first, click)], vec![(second, click), (first, click)]],
+            2,
+            |events, clicks| {
+                visited += 1;
+                assert_eq!(events.len(), 2);
+                let person = events[0].person();
+                assert!(events.iter().all(|event| event.person() == person));
+                assert_eq!(clicks.len(), if person == first { 2 } else { 1 });
+                assert!(clicks.iter().all(|row| row.0 == person));
+                Ok(())
+            },
+        )
+        .unwrap());
+        assert_eq!(visited, 2);
+        let guard = |_, _| panic!("oversized user should fail before aggregation");
+        assert!(visit_user_partition(vec![vec![x; 3]], vec![], 2, guard).is_err());
+        assert!(
+            visit_user_partition(vec![vec![x]], vec![vec![(first, click); 3]], 2, guard,).is_err()
+        );
+    }
+
+    #[test]
+    fn row_budget_counts_chunk_tails_and_enforces_the_exact_limit() {
+        let total = AtomicUsize::new(0);
+        for count in [3, 0, 2, 1, 0] {
+            assert!(claim_rows(&total, count, 6));
+        }
+        assert_eq!(total.load(Ordering::Relaxed), 6);
+        assert!(!claim_rows(&total, 1, 6));
+        assert!(!claim_rows(&AtomicUsize::new(0), 7, 6));
+    }
 
     #[test]
     fn compact_events_retain_exact_slices_and_signed_timestamps() {

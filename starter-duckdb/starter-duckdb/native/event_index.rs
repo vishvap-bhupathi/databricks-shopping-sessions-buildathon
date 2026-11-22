@@ -223,9 +223,11 @@ pub(super) fn prepare(
             return Err(io::Error::other("invalid text"));
         }
         let mut found = rows[i].lock().unwrap();
-        for (n, line) in lines(bytes).enumerate() {
-            if n % ROUTE_BATCH_ROWS == 0
-                && physical_rows.fetch_add(ROUTE_BATCH_ROWS, Ordering::Relaxed) >= MAX_INDEXED_ROWS
+        let mut scanned = 0;
+        for line in lines(bytes) {
+            scanned += 1;
+            if scanned % ROUTE_BATCH_ROWS == 0
+                && !claim_rows(&physical_rows, ROUTE_BATCH_ROWS, MAX_INDEXED_ROWS)
             {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -243,6 +245,9 @@ pub(super) fn prepare(
                 bitmap.mark(row.hash as usize);
                 found.push(row);
             }
+        }
+        if !claim_rows(&physical_rows, scanned % ROUTE_BATCH_ROWS, MAX_INDEXED_ROWS) {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "event row guard"));
         }
         Ok(())
     })?;
@@ -345,10 +350,11 @@ pub(super) fn route<'a>(
             }
         } else {
             let mut accepted = 0;
-            for (n, line) in lines(chunks[i]).enumerate() {
-                if n % ROUTE_BATCH_ROWS == 0
-                    && physical_rows.fetch_add(ROUTE_BATCH_ROWS, Ordering::Relaxed)
-                        >= MAX_INDEXED_ROWS
+            let mut scanned = 0;
+            for line in lines(chunks[i]) {
+                scanned += 1;
+                if scanned % ROUTE_BATCH_ROWS == 0
+                    && !claim_rows(&physical_rows, ROUTE_BATCH_ROWS, MAX_INDEXED_ROWS)
                 {
                     return Err(io::Error::other("event row guard"));
                 }
@@ -359,6 +365,9 @@ pub(super) fn route<'a>(
                     use_row(accepted, row, line)?;
                     accepted += 1;
                 }
+            }
+            if !claim_rows(&physical_rows, scanned % ROUTE_BATCH_ROWS, MAX_INDEXED_ROWS) {
+                return Err(io::Error::other("event row guard"));
             }
         }
         publish(users, &mut routes);
@@ -411,26 +420,28 @@ pub(super) fn resolve<'a>(
     profile: bool,
 ) -> io::Result<()> {
     if profile {
-        let count: usize = revisions
-            .0
-            .iter()
-            .map(|partition| {
-                partition
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .map(Vec::len)
-                    .sum::<usize>()
-            })
-            .sum();
+        let (mut count, mut capacity) = (0, 0);
+        for partition in &revisions.0 {
+            for batch in partition.lock().unwrap().iter() {
+                count += batch.len();
+                capacity += batch.capacity();
+            }
+        }
+        let record_bytes = std::mem::size_of::<Revision>();
+        let capacity_bytes = capacity * record_bytes;
         eprintln!(
-            "repeat_metadata rows {count} record_bytes {}",
-            std::mem::size_of::<Revision>()
+            "repeat_metadata rows {count} record_bytes {record_bytes} capacity_bytes {capacity_bytes}"
         );
     }
+    let winner_rows = AtomicUsize::new(0);
+    let winner_capacity = AtomicUsize::new(0);
     parallel(PARTITIONS, workers, |_, i| {
         let batches = std::mem::take(&mut *revisions.0[i].lock().unwrap());
         let winners = partition_winners(batches, MAX_PARTITION_ROWS)?;
+        if profile {
+            winner_rows.fetch_add(winners.len(), Ordering::Relaxed);
+            winner_capacity.fetch_add(winners.capacity(), Ordering::Relaxed);
+        }
         let mut routes = vec![Vec::new(); PARTITIONS];
         for winner in winners.into_values() {
             let fields = fields(winner.line, winner.cuts, winner.quoted);
@@ -440,7 +451,15 @@ pub(super) fn resolve<'a>(
         }
         publish(users, &mut routes);
         Ok(())
-    })
+    })?;
+    if profile {
+        eprintln!(
+            "winner_tables rows {} capacity {}",
+            winner_rows.load(Ordering::Relaxed),
+            winner_capacity.load(Ordering::Relaxed)
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
