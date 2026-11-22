@@ -56,16 +56,25 @@ impl<'a> Event<'a> {
     }
 }
 
-struct EngineDimensions {
-    aliases: Dictionary,
+struct EngineDimensions<'maps> {
+    aliases: HashMap<Id<'maps>, usize>,
+    canonical: Vec<Id<'maps>>,
     products: HashMap<Bytes, u32>,
     categories: Vec<Bytes>,
     unknown_category: u32,
 }
 
+impl EngineDimensions<'_> {
+    fn person<'a>(&'a self, user: Id<'a>) -> Id<'a> {
+        self.aliases
+            .get(user)
+            .map_or(user, |&root| self.canonical[root])
+    }
+}
+
 fn engine_event<'a>(
     fields: [Id<'a>; 7],
-    dims: &'a EngineDimensions,
+    dims: &'a EngineDimensions<'a>,
     start: i64,
     end: i64,
     ingest: i64,
@@ -73,7 +82,7 @@ fn engine_event<'a>(
     let Some((user, time, price, product)) = check_event(fields, start, end, ingest) else {
         return Ok(None);
     };
-    let person = dims.aliases.get(user).map_or(user, |v| v);
+    let person = dims.person(user);
     let category = if price.is_some() {
         dims.products
             .get(product)
@@ -186,11 +195,10 @@ fn root(parents: &mut [usize], mut i: usize) -> usize {
     i
 }
 
-fn dimensions(data: &Path) -> io::Result<EngineDimensions> {
-    let maps = files(&data.join("links"))?;
+fn dimensions<'a>(data: &Path, maps: &'a [Mapping]) -> io::Result<EngineDimensions<'a>> {
     let mut ids = HashMap::new();
     let (mut parent, mut sizes, mut minimum) = (Vec::new(), Vec::new(), Vec::new());
-    for map in &maps {
+    for map in maps {
         for [a, b] in records(rows(map.bytes())) {
             if a.is_empty() || b.is_empty() {
                 continue;
@@ -215,10 +223,13 @@ fn dimensions(data: &Path) -> io::Result<EngineDimensions> {
             }
         }
     }
-    let aliases = ids
-        .into_iter()
-        .map(|(id, i)| (id.into(), minimum[root(&mut parent, i)].into()))
-        .collect();
+    // Reuse the union-find's exact key table. Replacing each node with
+    // its root avoids rebuilding and allocating copies of both byte strings.
+    for node in ids.values_mut() {
+        *node = root(&mut parent, *node);
+    }
+    drop(parent);
+    drop(sizes);
     let catalog = Mapping::open(&data.join("products.csv"))?;
     let products: Vec<_> = records(rows(catalog.bytes()))
         .filter(|[id, cat]| !id.is_empty() && !cat.is_empty())
@@ -243,7 +254,8 @@ fn dimensions(data: &Path) -> io::Result<EngineDimensions> {
         .collect();
     let categories = categories.into_iter().map(Into::into).collect();
     Ok(EngineDimensions {
-        aliases,
+        aliases: ids,
+        canonical: minimum,
         products,
         categories,
         unknown_category,
@@ -348,7 +360,7 @@ fn record_time(duration: &mut Duration, start: Option<Instant>) {
 
 fn classify<'a>(
     chunks: &[&'a [u8]],
-    dims: &'a EngineDimensions,
+    dims: &'a EngineDimensions<'a>,
     users: &Routes<Event<'a>>,
     start: i64,
     end: i64,
@@ -436,7 +448,7 @@ fn classify<'a>(
 
 fn route_events<'a>(
     index: Vec<Partition<'a>>,
-    dims: &'a EngineDimensions,
+    dims: &'a EngineDimensions<'a>,
     users: &Routes<Event<'a>>,
     start: i64,
     end: i64,
@@ -472,36 +484,43 @@ fn route_events<'a>(
     })
 }
 
-fn route_clicks<'a>(
-    chunks: &[&'a [u8]],
-    dims: &'a EngineDimensions,
-    campaigns: &HashMap<Id, Id>,
-    users: &Routes<Routed<'a, Click<'a>>>,
+struct ClickWork<'a> {
+    chunks: Vec<Id<'a>>,
+    dims: &'a EngineDimensions<'a>,
+    campaigns: &'a HashMap<Id<'a>, Id<'a>>,
+    users: &'a Routes<Routed<'a, Click<'a>>>,
     start: i64,
     end: i64,
-    workers: usize,
-) -> io::Result<()> {
-    let count = AtomicUsize::new(0);
-    parallel(chunks.len(), workers, |_, i| {
+    count: AtomicUsize,
+}
+
+impl ClickWork<'_> {
+    fn route_chunk(&self, i: usize) -> io::Result<()> {
         let mut routes = vec![Vec::new(); PARTITIONS];
-        for (n, [click, id, campaign, ts]) in records(chunks[i]).enumerate() {
+        for (n, [click, id, campaign, ts]) in records(self.chunks[i]).enumerate() {
             if n % ROUTE_BATCH_ROWS == 0 {
-                if count.fetch_add(ROUTE_BATCH_ROWS, Ordering::Relaxed) >= MAX_CLICK_ROWS {
+                if self.count.fetch_add(ROUTE_BATCH_ROWS, Ordering::Relaxed) >= MAX_CLICK_ROWS {
                     return Err(io::Error::other("click row guard"));
                 }
-                publish(users, &mut routes);
+                publish(self.users, &mut routes);
             }
-            if id.is_empty() || click.is_empty() || !campaigns.contains_key(campaign) {
+            if id.is_empty() || click.is_empty() || !self.campaigns.contains_key(campaign) {
                 continue;
             }
-            if let Some(t) = timestamp(ts).filter(|&t| t >= start.saturating_sub(WEEK) && t < end) {
-                let person = dims.aliases.get(id).map_or(id, |v| v);
+            if let Some(t) =
+                timestamp(ts).filter(|&t| t >= self.start.saturating_sub(WEEK) && t < self.end)
+            {
+                let person = self.dims.person(id);
                 routes[bucket(person)].push((person, (t, click, campaign)));
             }
         }
-        publish(users, &mut routes);
+        publish(self.users, &mut routes);
         Ok(())
-    })
+    }
+
+    fn route(&self, workers: usize) -> io::Result<()> {
+        parallel(self.chunks.len(), workers, |_, i| self.route_chunk(i))
+    }
 }
 
 // Hex encodes arbitrary UTF-8 bytes, including CR, whitespace and NUL, across
@@ -692,10 +711,11 @@ pub fn run() -> io::Result<()> {
     };
     let event_maps = files(&data.join("events"))?;
     let event_chunks = chunks(&event_maps);
+    let link_maps = files(&data.join("links"))?;
     stage("event_map_and_chunk");
     let build_dimensions = || {
         let started = Instant::now();
-        let dims = dimensions(data)?;
+        let dims = dimensions(data, &link_maps)?;
         if profile {
             eprintln!(
                 "native identity_and_dimensions {:.6}",
@@ -713,6 +733,11 @@ pub fn run() -> io::Result<()> {
         let started = Instant::now();
         let index = if scan_mode == "two-pass" {
             EventIndex::Bitmap(repeat_filter(&event_chunks, index_workers)?)
+        } else if scan_mode == "sparse" {
+            EventIndex::Compact(event_index::Index::sparse(repeat_filter(
+                &event_chunks,
+                index_workers,
+            )?))
         } else {
             match event_index::prepare(&event_chunks, index_workers, scan_mode == "scalar", profile)
             {
@@ -750,35 +775,57 @@ pub fn run() -> io::Result<()> {
     stage("dimensions_and_index_wall");
     let users = routes();
     let clicks = routes();
-    let index = match repeats {
-        EventIndex::Compact(index) => {
-            event_index::route(index, &event_chunks, &dims, &users, start, end, workers)?
-        }
-        EventIndex::Bitmap(repeats) => classify(
-            &event_chunks,
-            &dims,
-            &users,
-            start,
-            end,
-            workers,
-            &repeats,
-            profile,
-        )?,
-    };
-    stage("event_classification");
-    route_events(index, &dims, &users, start, end, workers)?;
-    stage("event_validate_and_partition");
     let click_maps = files(&data.join("clicks"))?;
-    route_clicks(
-        &chunks(&click_maps),
-        &dims,
-        &campaigns,
-        &clicks,
+    let click_work = ClickWork {
+        chunks: chunks(&click_maps),
+        dims: &dims,
+        campaigns: &campaigns,
+        users: &clicks,
         start,
         end,
-        workers,
-    )?;
-    stage("click_partition");
+        count: AtomicUsize::new(0),
+    };
+    let overlap = matches!(&repeats, EventIndex::Compact(_))
+        && std::env::var("SHOPPING_SESSIONS_SCHEDULER").as_deref() == Ok("shared");
+    match repeats {
+        EventIndex::Compact(index) => {
+            let revisions = event_index::route(
+                index,
+                &event_chunks,
+                &dims,
+                &users,
+                start,
+                end,
+                workers,
+                overlap.then_some(&click_work),
+            )?;
+            stage(if overlap {
+                "event_and_click_classification"
+            } else {
+                "event_classification"
+            });
+            event_index::resolve(revisions, &dims, &users, start, end, workers, profile)?;
+        }
+        EventIndex::Bitmap(repeats) => {
+            let index = classify(
+                &event_chunks,
+                &dims,
+                &users,
+                start,
+                end,
+                workers,
+                &repeats,
+                profile,
+            )?;
+            stage("event_classification");
+            route_events(index, &dims, &users, start, end, workers)?;
+        }
+    }
+    stage("event_validate_and_partition");
+    if !overlap {
+        click_work.route(workers)?;
+        stage("click_partition");
+    }
     // Process the largest partitions first so a skewed partition cannot
     // become the final worker's entire tail.
     let mut partitions: Vec<_> = (0..PARTITIONS)
