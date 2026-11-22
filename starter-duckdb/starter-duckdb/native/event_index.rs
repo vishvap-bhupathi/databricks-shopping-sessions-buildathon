@@ -149,7 +149,9 @@ fn scanner(portable: bool) -> Scan {
             return |line| unsafe { neon(line) };
         }
         #[cfg(target_arch = "x86_64")]
-        if std::arch::is_x86_feature_detected!("avx2") {
+        if std::env::var("SHOPPING_SESSIONS_X86_SIMD").as_deref() == Ok("avx2")
+            && std::arch::is_x86_feature_detected!("avx2")
+        {
             return |line| unsafe { avx2(line) };
         }
         #[cfg(target_arch = "x86_64")]
@@ -475,6 +477,10 @@ mod tests {
             #[cfg(target_arch = "x86_64")]
             if std::arch::is_x86_feature_detected!("sse2") {
                 implementations.push(|line| unsafe { sse2(line) });
+            }
+            #[cfg(target_arch = "x86_64")]
+            if std::arch::is_x86_feature_detected!("avx2") {
+                implementations.push(|line| unsafe { avx2(line) });
             }
             for scan in implementations.drain(..) {
                 let actual = parse_row(&line, 0, scan).map(|row| row.fields(&line));
