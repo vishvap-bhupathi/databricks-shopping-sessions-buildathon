@@ -57,18 +57,47 @@ impl<'a> Event<'a> {
 }
 
 struct EngineDimensions<'maps> {
-    aliases: HashMap<Id<'maps>, usize>,
-    canonical: Vec<Id<'maps>>,
+    aliases: Aliases<'maps>,
     products: HashMap<Bytes, u32>,
     categories: Vec<Bytes>,
     unknown_category: u32,
 }
 
+enum Aliases<'a> {
+    Ordinals(HashMap<Id<'a>, usize>, Vec<Id<'a>>),
+    Direct(HashMap<Id<'a>, Id<'a>>),
+}
+
+impl<'a> Aliases<'a> {
+    fn new(ids: HashMap<Id<'a>, usize>, canonical: Vec<Id<'a>>, event_bytes: usize) -> Self {
+        // Building the direct map briefly retains both tables. The ordinal
+        // representation reuses the union-find table for smaller inputs or
+        // when the temporary rebuild would consume too much memory.
+        const DIRECT_ALIAS_MIN_EVENT_BYTES: usize = 1024 * 1024 * 1024;
+        const MAX_DIRECT_ALIAS_CAPACITY: usize = 2_000_000;
+        if event_bytes >= DIRECT_ALIAS_MIN_EVENT_BYTES
+            && !ids.is_empty()
+            && ids.capacity() <= MAX_DIRECT_ALIAS_CAPACITY
+        {
+            Self::Direct(
+                ids.into_iter()
+                    .map(|(id, root)| (id, canonical[root]))
+                    .collect(),
+            )
+        } else {
+            Self::Ordinals(ids, canonical)
+        }
+    }
+}
+
 impl EngineDimensions<'_> {
     fn person<'a>(&'a self, user: Id<'a>) -> Id<'a> {
-        self.aliases
-            .get(user)
-            .map_or(user, |&root| self.canonical[root])
+        match &self.aliases {
+            Aliases::Ordinals(ids, canonical) => {
+                ids.get(user).map_or(user, |&root| canonical[root])
+            }
+            Aliases::Direct(ids) => ids.get(user).copied().unwrap_or(user),
+        }
     }
 }
 
@@ -195,7 +224,11 @@ fn root(parents: &mut [usize], mut i: usize) -> usize {
     i
 }
 
-fn dimensions<'a>(data: &Path, maps: &'a [Mapping]) -> io::Result<EngineDimensions<'a>> {
+fn dimensions<'a>(
+    data: &Path,
+    maps: &'a [Mapping],
+    event_bytes: usize,
+) -> io::Result<EngineDimensions<'a>> {
     let mut ids = HashMap::new();
     let (mut parent, mut sizes, mut minimum) = (Vec::new(), Vec::new(), Vec::new());
     for map in maps {
@@ -254,8 +287,7 @@ fn dimensions<'a>(data: &Path, maps: &'a [Mapping]) -> io::Result<EngineDimensio
         .collect();
     let categories = categories.into_iter().map(Into::into).collect();
     Ok(EngineDimensions {
-        aliases: ids,
-        canonical: minimum,
+        aliases: Aliases::new(ids, minimum, event_bytes),
         products,
         categories,
         unknown_category,
@@ -670,17 +702,68 @@ fn aggregate<'a>(
     Ok(())
 }
 
-fn drain_partition<T>(routes: &Routes<T>, partition: usize) -> io::Result<Vec<T>> {
-    let chunks = std::mem::take(&mut *routes[partition].lock().unwrap());
-    let rows: usize = chunks.iter().map(Vec::len).sum();
-    if rows > MAX_USER_PARTITION_ROWS {
-        return Err(io::Error::other("user partition guard"));
-    }
-    let mut rows = Vec::with_capacity(rows);
+fn flatten_partition<T>(chunks: Vec<Vec<T>>, count: usize) -> Vec<T> {
+    let mut rows = Vec::with_capacity(count);
     for mut chunk in chunks {
         rows.append(&mut chunk);
     }
-    Ok(rows)
+    rows
+}
+
+const USER_SUBPARTITIONS: usize = 32;
+const MAX_USER_REPARTITION_BYTES: usize = 128 * 1024 * 1024;
+
+fn split_user_partition<'a, T>(
+    chunks: Vec<Vec<T>>,
+    person: impl Fn(&T) -> Id<'a>,
+    limit: usize,
+) -> io::Result<[Vec<T>; USER_SUBPARTITIONS]> {
+    // The primary route folds the high and low halves of the hash together.
+    // Use the high half alone to obtain a different partition of those rows.
+    let shard = |row: &T| (key_hash(person(row)) >> 32) as usize & (USER_SUBPARTITIONS - 1);
+    let mut counts = [0; USER_SUBPARTITIONS];
+    for row in chunks.iter().flatten() {
+        counts[shard(row)] += 1;
+    }
+    if counts.iter().any(|&count| count > limit) {
+        return Err(io::Error::other("user partition guard after repartition"));
+    }
+    let mut partitions = counts.map(Vec::with_capacity);
+    for row in chunks.into_iter().flatten() {
+        partitions[shard(&row)].push(row);
+    }
+    Ok(partitions)
+}
+
+fn visit_user_partition<'a>(
+    event_chunks: Vec<Vec<Event<'a>>>,
+    click_chunks: Vec<Vec<Routed<'a, Click<'a>>>>,
+    limit: usize,
+    mut visit: impl FnMut(Vec<Event<'a>>, Vec<Routed<'a, Click<'a>>>) -> io::Result<()>,
+) -> io::Result<bool> {
+    let event_count = event_chunks.iter().map(Vec::len).sum();
+    let click_count = click_chunks.iter().map(Vec::len).sum();
+    if event_count <= limit && click_count <= limit {
+        visit(
+            flatten_partition(event_chunks, event_count),
+            flatten_partition(click_chunks, click_count),
+        )?;
+        return Ok(false);
+    }
+    let additional_bytes = event_count
+        .saturating_mul(std::mem::size_of::<Event<'_>>())
+        .saturating_add(click_count.saturating_mul(std::mem::size_of::<Routed<'_, Click<'_>>>()));
+    if additional_bytes > MAX_USER_REPARTITION_BYTES {
+        return Err(io::Error::other("user repartition memory guard"));
+    }
+    let events = split_user_partition(event_chunks, Event::person, limit)?;
+    let clicks = split_user_partition(click_chunks, |row| row.0, limit)?;
+    for (events, clicks) in IntoIterator::into_iter(events).zip(clicks) {
+        if !events.is_empty() {
+            visit(events, clicks)?;
+        }
+    }
+    Ok(true)
 }
 
 pub fn run() -> io::Result<()> {
@@ -711,16 +794,22 @@ pub fn run() -> io::Result<()> {
     };
     let event_maps = files(&data.join("events"))?;
     let event_chunks = chunks(&event_maps);
+    let event_bytes = event_chunks.iter().map(|bytes| bytes.len()).sum();
     let link_maps = files(&data.join("links"))?;
     stage("event_map_and_chunk");
     let build_dimensions = || {
         let started = Instant::now();
-        let dims = dimensions(data, &link_maps)?;
+        let dims = dimensions(data, &link_maps, event_bytes)?;
         if profile {
             eprintln!(
                 "native identity_and_dimensions {:.6}",
                 started.elapsed().as_secs_f64()
             );
+            let (layout, count) = match &dims.aliases {
+                Aliases::Ordinals(ids, _) => ("ordinals", ids.len()),
+                Aliases::Direct(ids) => ("direct", ids.len()),
+            };
+            eprintln!("alias_index layout {layout} rows {count}");
         }
         Ok::<_, io::Error>(dims)
     };
@@ -859,43 +948,56 @@ pub fn run() -> io::Result<()> {
         {
             timings.enabled = profile;
             let prepare_clock = timings.start();
-            let mut events = drain_partition(&users, partition)?;
-            let mut history = drain_partition(&clicks, partition)?;
-            timings.record(0, prepare_clock);
-            let sort_clock = timings.start();
-            events.sort_unstable_by(|a, b| {
-                a.person()
-                    .cmp(b.person())
-                    .then_with(|| a.timestamp.cmp(&b.timestamp))
-            });
-            timings.record(1, sort_clock);
-            let sort_clock = timings.start();
-            history.sort_unstable();
-            // All copies of a click are identical and route to the same user.
-            history.dedup();
-            timings.record(2, sort_clock);
-            // Sample four evenly spaced groups of partitions to limit clock overhead.
-            timings.enabled = profile && (partition / workers) % 8 == 0;
-            let mut remaining_clicks = history.as_slice();
-            for person_events in events.chunk_by(|a, b| a.person() == b.person()) {
-                let group_clock = timings.start();
-                let person = person_events[0].person();
-                let from = remaining_clicks.partition_point(|row| row.0 < person);
-                remaining_clicks = &remaining_clicks[from..];
-                let through = remaining_clicks.partition_point(|row| row.0 == person);
-                let (person_clicks, remaining) = remaining_clicks.split_at(through);
-                remaining_clicks = remaining;
-                timings.record(3, group_clock);
-                aggregate(
-                    person,
-                    person_events,
-                    person_clicks,
-                    &dims.categories,
-                    &mut workspace,
-                    &mut totals,
-                    &mut out,
-                    &mut timings,
-                )?;
+            let event_chunks = std::mem::take(&mut *users[partition].lock().unwrap());
+            let click_chunks = std::mem::take(&mut *clicks[partition].lock().unwrap());
+            let mut prepare_clock = prepare_clock;
+            let split = visit_user_partition(
+                event_chunks,
+                click_chunks,
+                MAX_USER_PARTITION_ROWS,
+                |mut events, mut history| {
+                    timings.enabled = profile;
+                    timings.record(0, prepare_clock.take());
+                    let sort_clock = timings.start();
+                    events.sort_unstable_by(|a, b| {
+                        a.person()
+                            .cmp(b.person())
+                            .then_with(|| a.timestamp.cmp(&b.timestamp))
+                    });
+                    timings.record(1, sort_clock);
+                    let sort_clock = timings.start();
+                    history.sort_unstable();
+                    // All copies of a click are identical and route to the same user.
+                    history.dedup();
+                    timings.record(2, sort_clock);
+                    // Sample four evenly spaced groups of partitions to limit clock overhead.
+                    timings.enabled = profile && (partition / workers) % 8 == 0;
+                    let mut remaining_clicks = history.as_slice();
+                    for person_events in events.chunk_by(|a, b| a.person() == b.person()) {
+                        let group_clock = timings.start();
+                        let person = person_events[0].person();
+                        let from = remaining_clicks.partition_point(|row| row.0 < person);
+                        remaining_clicks = &remaining_clicks[from..];
+                        let through = remaining_clicks.partition_point(|row| row.0 == person);
+                        let (person_clicks, remaining) = remaining_clicks.split_at(through);
+                        remaining_clicks = remaining;
+                        timings.record(3, group_clock);
+                        aggregate(
+                            person,
+                            person_events,
+                            person_clicks,
+                            &dims.categories,
+                            &mut workspace,
+                            &mut totals,
+                            &mut out,
+                            &mut timings,
+                        )?;
+                    }
+                    Ok(())
+                },
+            )?;
+            if split && profile {
+                eprintln!("repartitioned_user_partition {partition}");
             }
         }
         out.flush()?;
@@ -948,6 +1050,67 @@ pub fn run() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_user_partition_splits_both_histories_by_exact_person() {
+        let first = b"first";
+        let second = (0..)
+            .map(|i| format!("other-{i}"))
+            .find(|id| {
+                let bytes = id.as_bytes();
+                bucket(bytes) == bucket(first)
+                    && ((key_hash(bytes) ^ key_hash(first)) >> 32) & 31 != 0
+            })
+            .unwrap();
+        let second = second.as_bytes();
+        let x = Event::new(first, 1, 0, 2).unwrap();
+        let y = Event::new(second, 2, 1, 3).unwrap();
+        let click = (0, &b"click"[..], &b"campaign"[..]);
+        let mut visited = 0;
+        assert!(visit_user_partition(
+            vec![vec![x, y], vec![y, x]],
+            vec![vec![(first, click)], vec![(second, click), (first, click)]],
+            2,
+            |events, clicks| {
+                visited += 1;
+                assert_eq!(events.len(), 2);
+                let person = events[0].person();
+                assert!(events.iter().all(|event| event.person() == person));
+                assert_eq!(clicks.len(), if person == first { 2 } else { 1 });
+                assert!(clicks.iter().all(|row| row.0 == person));
+                Ok(())
+            },
+        )
+        .unwrap());
+        assert_eq!(visited, 2);
+        let guard = |_, _| panic!("oversized user should fail before aggregation");
+        assert!(visit_user_partition(vec![vec![x; 3]], vec![], 2, guard).is_err());
+        assert!(
+            visit_user_partition(vec![vec![x]], vec![vec![(first, click); 3]], 2, guard,).is_err()
+        );
+    }
+
+    #[test]
+    fn direct_alias_index_shares_exact_keys_and_uses_original_for_absent_names() {
+        let root = " id".as_bytes();
+        let other = "猫".as_bytes();
+        let ids = HashMap::from([(root, 0), (other, 0), (&b"own"[..], 2)]);
+        let names = vec![root, other, &b"own"[..]];
+        for event_bytes in [0, 1024 * 1024 * 1024] {
+            let dims = EngineDimensions {
+                aliases: Aliases::new(ids.clone(), names.clone(), event_bytes),
+                products: HashMap::new(),
+                categories: vec![],
+                unknown_category: 0,
+            };
+            assert_eq!(matches!(dims.aliases, Aliases::Direct(_)), event_bytes > 0);
+            assert_eq!(dims.person(root), root);
+            assert_eq!(dims.person(other), root);
+            assert_eq!(dims.person(b"own"), b"own");
+            assert_eq!(dims.person(b"id"), b"id");
+            assert_eq!(dims.person(b"own\r"), b"own\r");
+        }
+    }
 
     #[test]
     fn compact_events_retain_exact_slices_and_signed_timestamps() {
